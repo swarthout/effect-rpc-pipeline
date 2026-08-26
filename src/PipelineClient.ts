@@ -2,21 +2,26 @@ import * as Context from "effect/Context"
 import * as Effect from "effect/Effect"
 import * as Layer from "effect/Layer"
 import * as Option from "effect/Option"
+import type * as Scope from "effect/Scope"
+import * as FetchHttpClient from "effect/unstable/http/FetchHttpClient"
 import * as Headers from "effect/unstable/http/Headers"
 import type * as RpcMiddleware from "effect/unstable/rpc/RpcMiddleware"
 import * as RpcClient from "effect/unstable/rpc/RpcClient"
 import { RpcClientDefect, RpcClientError } from "effect/unstable/rpc/RpcClientError"
 import type * as Rpc from "effect/unstable/rpc/Rpc"
-import type * as RpcGroup from "effect/unstable/rpc/RpcGroup"
+import * as RpcGroup from "effect/unstable/rpc/RpcGroup"
+import type * as RpcSerialization from "effect/unstable/rpc/RpcSerialization"
+import { RequestId } from "effect/unstable/rpc/RpcMessage"
+import * as Socket from "effect/unstable/socket/Socket"
 import type { ClientApi, PipelineRequest, PipelineTransport } from "./Pipeline.js"
 import { makeClient } from "./Pipeline.js"
+import * as Duplex from "./Duplex.js"
+import { PipelineRpc } from "./PipelineServer.js"
 
 export type PipelineResponse =
   | { readonly _tag: "Success"; readonly value: unknown }
   | { readonly _tag: "Failure"; readonly error: unknown }
 export { type PipelineTransport }
-
-export class Protocol extends Context.Service<Protocol, PipelineTransport>()("effect-rpc-pipeline/Protocol") {}
 
 const revive = (value: unknown): unknown => {
   if (Array.isArray(value)) return value.map(revive)
@@ -29,21 +34,42 @@ const revive = (value: unknown): unknown => {
   return value
 }
 
-const makeTransport = (url: string): PipelineTransport => (request, options) => Effect.tryPromise({
-  try: async () => {
-    const response = await fetch(url, {
-      method: "POST",
-      headers: { ...options?.headers, "content-type": "application/json" },
-      body: JSON.stringify(request)
-    })
-    if (!response.ok) throw new Error(`Pipeline HTTP ${response.status}`)
-    return await response.json() as PipelineResponse
-  },
-  catch: (error) => error
-})
+/** Effect-native HTTP protocol using the platform HttpClient. */
+export const layerProtocolHttp = RpcClient.layerProtocolHttp
 
-export const layerTransport = (transport: PipelineTransport): Layer.Layer<Protocol> => Layer.succeed(Protocol, transport)
-export const layerHttp = (options: { readonly url: string }): Layer.Layer<Protocol> => layerTransport(makeTransport(options.url))
+/** Effect-native HTTP protocol using globalThis.fetch. */
+export const layerHttp = (options: Parameters<typeof RpcClient.layerProtocolHttp>[0]): Layer.Layer<
+  RpcClient.Protocol,
+  never,
+  RpcSerialization.RpcSerialization
+> => RpcClient.layerProtocolHttp(options).pipe(Layer.provide(FetchHttpClient.layer))
+
+/** Effect-native WebSocket protocol using an Effect Socket. */
+export const layerProtocolWebSocket = RpcClient.layerProtocolSocket
+
+/** Effect-native WebSocket protocol using Socket.layerWebSocket. */
+export const layerWebSocket = (options: {
+  readonly url: string | Effect.Effect<string>
+  readonly openTimeout?: Parameters<typeof Socket.layerWebSocket>[1] extends infer O ? O extends { readonly openTimeout?: infer A } ? A : never : never
+  readonly protocols?: string | Array<string>
+  readonly closeCodeIsError?: (code: number) => boolean
+  readonly retryTransientErrors?: boolean
+  readonly onTransientError?: (error: RpcClientError) => Effect.Effect<void>
+}): Layer.Layer<
+  RpcClient.Protocol,
+  never,
+  RpcSerialization.RpcSerialization | Socket.WebSocketConstructor
+> => RpcClient.layerProtocolSocket({
+  ...(options.retryTransientErrors === undefined ? {} : { retryTransientErrors: options.retryTransientErrors }),
+  ...(options.onTransientError === undefined ? {} : { onTransientError: options.onTransientError })
+}).pipe(
+  Layer.provide(Socket.layerWebSocket(options.url, {
+    ...(options.openTimeout === undefined ? {} : { openTimeout: options.openTimeout }),
+    ...(options.protocols === undefined ? {} : { protocols: options.protocols }),
+    ...(options.closeCodeIsError === undefined ? {} : { closeCodeIsError: options.closeCodeIsError })
+  })),
+  Layer.merge(Layer.succeed(Duplex.Enabled, true))
+) as any
 
 const applyClientMiddleware = <Rpcs extends Rpc.Any>(
   group: RpcGroup.RpcGroup<Rpcs>,
@@ -104,22 +130,60 @@ const makeWithTransport = <Rpcs extends Rpc.Any>(
   return makeClient(group, id, execute)
 })
 
+const makeNative = <Rpcs extends Rpc.Any>(
+  group: RpcGroup.RpcGroup<Rpcs>,
+  id: string
+): Effect.Effect<ClientApi<Rpcs>, never, RpcClient.Protocol | Rpc.MiddlewareClient<Rpcs> | Scope.Scope> => Effect.gen(function*() {
+  const middlewareServices = yield* Effect.context<Rpc.MiddlewareClient<Rpcs>>()
+  let requestSequence = 0
+  const combined = group
+    .add(PipelineRpc)
+    .add(Duplex.SessionRpc)
+    .add(Duplex.ReplyRpc)
+    .add(Duplex.CallServerCapabilityRpc)
+    .add(Duplex.ReleaseCapabilityRpc)
+  const client = yield* RpcClient.make(combined, {
+    generateRequestId: () => RequestId(`pipeline:${requestSequence++}`)
+  })
+  const duplexEnabled = yield* Duplex.Enabled
+  const session = duplexEnabled ? yield* Duplex.makeClientSession(client as any) : undefined
+  if (session !== undefined) yield* Effect.orDie(session.ready)
+  const execute = (request: PipelineRequest) => Effect.gen(function*() {
+    const headers = yield* RpcClient.CurrentHeaders
+    const response = yield* applyClientMiddleware(
+      group,
+      middlewareServices,
+      request,
+      headers,
+      (nextHeaders) => (client as any)[PipelineRpc._tag](request, { headers: nextHeaders }) as Effect.Effect<PipelineResponse, unknown>
+    )
+    return yield* response._tag === "Success"
+      ? Effect.succeed(session?.decode(revive(response.value)) ?? revive(response.value))
+      : Effect.fail(revive(response.error))
+  }).pipe(Effect.mapError((cause) => cause && typeof cause === "object" && "_tag" in cause
+    ? cause
+    : new RpcClientError({ reason: new RpcClientDefect({ message: "Pipeline request failed", cause }) })))
+  return makeClient(group, id, execute, {
+    streamClient: client as any,
+    ...(session === undefined ? {} : { encodeLiteral: session.encodeLiteral })
+  })
+})
+
 /** Creates a client using a supplied transport or the Effect-native Protocol service. */
 export function make<Rpcs extends Rpc.Any>(
   group: RpcGroup.RpcGroup<Rpcs>,
-  options: ({ readonly transport: PipelineTransport } | { readonly url: string }) & { readonly id?: string }
+  options: { readonly transport: PipelineTransport; readonly id?: string }
 ): Effect.Effect<ClientApi<Rpcs>, never, Rpc.MiddlewareClient<Rpcs>>
 export function make<Rpcs extends Rpc.Any>(
   group: RpcGroup.RpcGroup<Rpcs>,
   options?: { readonly id?: string }
-): Effect.Effect<ClientApi<Rpcs>, never, Protocol | Rpc.MiddlewareClient<Rpcs>>
+): Effect.Effect<ClientApi<Rpcs>, never, RpcClient.Protocol | Rpc.MiddlewareClient<Rpcs> | Scope.Scope>
 export function make<Rpcs extends Rpc.Any>(
   group: RpcGroup.RpcGroup<Rpcs>,
-  options: (({ readonly transport: PipelineTransport } | { readonly url: string }) & { readonly id?: string }) | { readonly id?: string } = {}
-): Effect.Effect<ClientApi<Rpcs>, never, Protocol | Rpc.MiddlewareClient<Rpcs>> {
+  options: ({ readonly transport: PipelineTransport; readonly id?: string } | { readonly id?: string }) = {}
+): Effect.Effect<ClientApi<Rpcs>, never, RpcClient.Protocol | Rpc.MiddlewareClient<Rpcs> | Scope.Scope> {
   if ("transport" in options) return makeWithTransport(group, options.transport, options.id ?? "default")
-  if ("url" in options) return makeWithTransport(group, makeTransport(options.url), options.id ?? "default")
-  return Effect.flatMap(Protocol, (transport) => makeWithTransport(group, transport, options.id ?? "default"))
+  return makeNative(group, options.id ?? "default")
 }
 
 export const transportFromHandler = (handler: (request: PipelineRequest) => Effect.Effect<PipelineResponse, unknown>): PipelineTransport => handler as PipelineTransport

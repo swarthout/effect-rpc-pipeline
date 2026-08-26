@@ -1,7 +1,10 @@
 import * as Effect from "effect/Effect"
+import * as Stream from "effect/Stream"
+import type * as RpcGroup from "effect/unstable/rpc/RpcGroup"
 import * as Pipeline from "effect-rpc-pipeline/Pipeline"
 import * as PipelineClient from "effect-rpc-pipeline/PipelineClient"
-import { makeTodoState, TodoRpcs, type Todo, type TodoFilter, type TodoState } from "./todo.js"
+import type { PipelineRequest } from "effect-rpc-pipeline/Pipeline"
+import { makeTodoState, TodoRpcs, type Todo, type TodoEvent, type TodoFilter, type TodoState } from "./todo.js"
 
 export type TodoClient = {
   readonly snapshot: (filter?: TodoFilter) => Effect.Effect<TodoState, unknown>
@@ -13,8 +16,13 @@ export type TodoClient = {
   readonly clearCompleted: (filter?: TodoFilter) => Effect.Effect<TodoState, unknown>
 }
 
-export const makeTodoClient = (url: string): Effect.Effect<TodoClient> => Effect.gen(function*() {
-  const rpc = yield* PipelineClient.make(TodoRpcs, { url, id: "todo-mvc" })
+export type LiveTodoClient = TodoClient & {
+  readonly watch: (filter?: TodoFilter) => Stream.Stream<TodoEvent, unknown>
+}
+
+type TodoRpcClient = Pipeline.ClientApi<RpcGroup.Rpcs<typeof TodoRpcs>>
+
+const fromRpc = (rpc: TodoRpcClient): TodoClient => {
 
   const query = (filter: TodoFilter) => Pipeline.all({
     todos: rpc.listTodos({ filter }),
@@ -38,4 +46,29 @@ export const makeTodoClient = (url: string): Effect.Effect<TodoClient> => Effect
     remove: (todo, filter = "all") => mutateThenQuery(rpc.deleteTodo({ id: todo.id }), filter),
     clearCompleted: (filter = "all") => mutateThenQuery(rpc.clearCompletedTodos(), filter)
   }
-})
+}
+
+const httpTransport = (url: string): Pipeline.PipelineTransport => (request: PipelineRequest, options) => Effect.tryPromise({
+  try: async () => {
+    const response = await fetch(url, {
+      method: "POST",
+      headers: { ...options?.headers, "content-type": "application/json" },
+      body: JSON.stringify(request)
+    })
+    if (!response.ok) throw new Error(`Todo pipeline HTTP ${response.status}`)
+    return await response.json()
+  },
+  catch: (error) => error
+}) as any
+
+/** TodoMVC facade for the standalone raw-HTTP example server. */
+export const makeTodoClient = (url: string): Effect.Effect<TodoClient> => Effect.map(
+  PipelineClient.make(TodoRpcs, { transport: httpTransport(url), id: "todo-mvc" }),
+  fromRpc
+)
+
+/** Native client for use inside a PipelineClient HTTP or WebSocket layer scope. */
+export const makeLiveTodoClient = () => Effect.map(
+  PipelineClient.make(TodoRpcs, { id: "todo-mvc" }),
+  (rpc) => ({ ...fromRpc(rpc), watch: (filter: TodoFilter = "all") => rpc.watchTodos({ filter }) })
+)

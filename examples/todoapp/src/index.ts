@@ -24,7 +24,17 @@ const server = createServer((request, response) => {
 })
 
 server.listen(8787, async () => {
-  const client = await Effect.runPromise(PipelineClient.make(AppRpcs, { id: "example-app", url: "http://localhost:8787/rpc" }))
+  const client = await Effect.runPromise(PipelineClient.make(AppRpcs, {
+    id: "example-app",
+    transport: (pipeline) => Effect.tryPromise({
+      try: () => fetch("http://localhost:8787/rpc", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify(pipeline)
+      }).then((response) => response.json()),
+      catch: (error) => error
+    }) as any
+  }))
   const session = client.authenticate({ token: "demo-token" })
   const userId = session.getUserId()
   const profile = client.getUserProfile({ id: userId })

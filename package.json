@@ -5,16 +5,42 @@
   "type": "module",
   "license": "MIT",
   "sideEffects": false,
-  "files": ["dist", "README.md", "LICENSE"],
+  "files": [
+    "dist",
+    "README.md",
+    "LICENSE"
+  ],
   "main": "./dist/index.mjs",
   "types": "./dist/index.d.mts",
   "exports": {
-    ".": { "types": "./dist/index.d.mts", "import": "./dist/index.mjs" },
-    "./Pipeline": { "types": "./dist/Pipeline.d.mts", "import": "./dist/Pipeline.mjs" },
-    "./PipelineClient": { "types": "./dist/PipelineClient.d.mts", "import": "./dist/PipelineClient.mjs" },
-    "./PipelineServer": { "types": "./dist/PipelineServer.d.mts", "import": "./dist/PipelineServer.mjs" },
-    "./Capability": { "types": "./dist/Capability.d.mts", "import": "./dist/Capability.mjs" },
-    "./RequestBatching": { "types": "./dist/RequestBatching.d.mts", "import": "./dist/RequestBatching.mjs" }
+    ".": {
+      "types": "./dist/index.d.mts",
+      "import": "./dist/index.mjs"
+    },
+    "./Pipeline": {
+      "types": "./dist/Pipeline.d.mts",
+      "import": "./dist/Pipeline.mjs"
+    },
+    "./PipelineClient": {
+      "types": "./dist/PipelineClient.d.mts",
+      "import": "./dist/PipelineClient.mjs"
+    },
+    "./PipelineServer": {
+      "types": "./dist/PipelineServer.d.mts",
+      "import": "./dist/PipelineServer.mjs"
+    },
+    "./Capability": {
+      "types": "./dist/Capability.d.mts",
+      "import": "./dist/Capability.mjs"
+    },
+    "./Duplex": {
+      "types": "./dist/Duplex.d.mts",
+      "import": "./dist/Duplex.mjs"
+    },
+    "./RequestBatching": {
+      "types": "./dist/RequestBatching.d.mts",
+      "import": "./dist/RequestBatching.mjs"
+    }
   },
   "scripts": {
     "build": "tsdown --config-loader native",
@@ -23,8 +49,11 @@
     "test:watch": "vitest",
     "pack:check": "npm run build && npm pack --dry-run"
   },
-  "peerDependencies": { "effect": ">=4.0.0-rc.112 <5" },
+  "peerDependencies": {
+    "effect": ">=4.0.0-rc.112 <5"
+  },
   "devDependencies": {
+    "@effect/platform-node": "^4.0.0-rc.112",
     "@types/node": "^24.0.0",
     "capnweb": "0.12.0",
     "effect": "4.0.0-rc.112",

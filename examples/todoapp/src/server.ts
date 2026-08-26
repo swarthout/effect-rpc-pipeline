@@ -51,8 +51,13 @@ export const AppLive = AppRpcs.toLayer(AppHandlers)
 export const ServerLive = PipelineServer.layerHttp({
   group: AppRpcs,
   id: "example-app",
-  path: "/rpc",
-  protocol: "http"
+  path: "/rpc"
+}).pipe(Layer.provide(AppLive))
+
+export const WebSocketServerLive = PipelineServer.layerWebSocket({
+  group: AppRpcs,
+  id: "example-app",
+  path: "/rpc"
 }).pipe(Layer.provide(AppLive))
 
 export const handlePipeline = async (request: unknown) => {

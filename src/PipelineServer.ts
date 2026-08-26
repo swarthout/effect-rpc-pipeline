@@ -13,6 +13,7 @@ import * as Schema from "effect/Schema"
 import * as Layer from "effect/Layer"
 import type { CapabilityInstance } from "./Capability.js"
 import { isInstance } from "./Capability.js"
+import * as Duplex from "./Duplex.js"
 import { PipelineProtocolError, type Expr, type PipelineNode, type PipelineRequest } from "./Pipeline.js"
 import type { PipelineResponse } from "./PipelineClient.js"
 import { makeScope, RequestScope } from "./RequestBatching.js"
@@ -48,11 +49,13 @@ export interface ServerOptions<EX = never, RX = never> {
 
 /** Runs the complete pipeline on Effect SQL's transaction connection. */
 export const sqlTransaction: AroundExecution<SqlError, SqlClient.SqlClient> =
-  (execution) => Effect.flatMap(SqlClient.SqlClient, (sql) => sql.withTransaction(execution))
+  (execution) => Effect.flatMap(SqlClient.SqlClient, (sql) => sql.withTransaction(
+    Effect.provideService(execution, Duplex.InTransaction, true)
+  ))
 
 const PathSchema = Schema.Array(Schema.Union([Schema.String, Schema.Number]))
 export const ExprSchema: Schema.Schema<Expr> = Schema.suspend(() => Schema.Union([
-  Schema.Struct({ _tag: Schema.Literal("literal"), value: Schema.optionalKey(Schema.Unknown) }),
+  Schema.Struct({ _tag: Schema.Literal("literal"), value: Schema.optionalKey(Schema.Json) }),
   Schema.Struct({ _tag: Schema.Literal("ref"), id: Schema.String, path: PathSchema }),
   Schema.Struct({ _tag: Schema.Literal("item"), path: PathSchema }),
   Schema.Struct({ _tag: Schema.Literal("array"), values: Schema.Array(ExprSchema) }),
@@ -159,8 +162,11 @@ const executeNode = <R extends Rpc.Any>(definition: ServerDefinition<R>, node: P
     )
   }
   return Effect.try({ try: () => evalExpr(node.payload, values, item), catch: (error) => error }).pipe(
-    Effect.flatMap((payload) => {
-      const target = node.target ? evalExpr(node.target, values, item) : undefined
+    Effect.flatMap((rawPayload) => {
+      const duplex = Context.getOrUndefined(context, Duplex.Server)
+      const payload = duplex === undefined ? rawPayload : Duplex.resolveServerValue(duplex, metadata.client.id, rawPayload)
+      const rawTarget = node.target ? evalExpr(node.target, values, item) : undefined
+      const target = duplex === undefined ? rawTarget : Duplex.resolveServerValue(duplex, metadata.client.id, rawTarget)
       if (target !== undefined && !isInstance(target)) return Effect.fail(new PipelineProtocolError("Call target is not a capability", "InvalidTarget"))
       if (target !== undefined) {
         const instance = target as CapabilityInstance
@@ -260,7 +266,13 @@ const handleWithContext = <R extends Rpc.Any, EX, RX>(
     : options.aroundExecution(execution, { group, request, metadata })
   return wrapped.pipe(
     Effect.provideContext(scopedContext),
-    Effect.map((value): PipelineResponse => ({ _tag: "Success", value })),
+    Effect.map((value): PipelineResponse => {
+      const duplex = Context.getOrUndefined(scopedContext, Duplex.Server)
+      return {
+        _tag: "Success",
+        value: duplex === undefined ? value : Duplex.encodeServerValue(duplex, metadata.client.id, value)
+      }
+    }),
     Effect.catch((error): Effect.Effect<PipelineResponse> => Effect.succeed({ _tag: "Failure", error }))
   )
 }
@@ -280,29 +292,71 @@ export const handle = <R extends Rpc.Any, EX = never, RX = never>(
 
 export const augment = <R extends Rpc.Any>(group: RpcGroup.RpcGroup<R>): RpcGroup.RpcGroup<R | typeof PipelineRpc> => group.add(PipelineRpc)
 
+export const augmentDuplex = <R extends Rpc.Any>(group: RpcGroup.RpcGroup<R>) => augment(group)
+  .add(Duplex.SessionRpc)
+  .add(Duplex.ReplyRpc)
+  .add(Duplex.CallServerCapabilityRpc)
+  .add(Duplex.ReleaseCapabilityRpc)
+
+const makePipelineHandlerContext = <R extends Rpc.Any, EX, RX>(
+  group: RpcGroup.RpcGroup<R>,
+  context: Context.Context<Requirements<R> | RX>,
+  options?: ServerOptions<EX, RX>
+): Context.Context<Rpc.ToHandler<typeof PipelineRpc>> => {
+  const handler = (request: PipelineRequest, metadata: RequestMetadata) => handleWithContext(group, request, context, metadata, options)
+  return Context.makeUnsafe(new Map([[PipelineRpc.key, { tag: PipelineRpc._tag, handler, context }]])) as Context.Context<Rpc.ToHandler<typeof PipelineRpc>>
+}
+
 export const layer = <R extends Rpc.Any, EX = never, RX = never>(group: RpcGroup.RpcGroup<R>, options?: ServerOptions<EX, RX>): Layer.Layer<Rpc.ToHandler<typeof PipelineRpc>, never, Requirements<R> | RX> =>
-  Layer.effectContext(Effect.gen(function*() {
-    const context = yield* Effect.context<Requirements<R> | RX>()
-    const handler = (request: PipelineRequest, metadata: RequestMetadata) => handleWithContext(group, request, context, metadata, options)
-    return Context.makeUnsafe(new Map([[PipelineRpc.key, { tag: PipelineRpc._tag, handler, context }]]))
-  }))
+  Layer.effectContext(Effect.map(
+    Effect.context<Requirements<R> | RX>(),
+    (context) => makePipelineHandlerContext(group, context, options)
+  ))
 
 export const layerHttp = <R extends Rpc.Any, EX = never, RX = never>(options: {
   readonly group: RpcGroup.RpcGroup<R>
   readonly path: string
-  readonly protocol?: "http" | "websocket"
 } & ServerOptions<EX, RX>): Layer.Layer<
   never,
   never,
   RpcSerialization.RpcSerialization | HttpRouter.HttpRouter | Requirements<R> | RX
 > => {
+  const AllHandlers = Layer.effectContext(Effect.map(
+    Effect.context<Requirements<R> | RX>(),
+    (context) => Context.merge(context, makePipelineHandlerContext(options.group, context, options))
+  ))
   return RpcServer.layerHttp({
     group: augment(options.group),
     path: options.path as any,
-    protocol: options.protocol ?? "http"
-  }).pipe(Layer.provide(layer<R, EX, RX>(options.group, options))) as Layer.Layer<
+    protocol: "http"
+  }).pipe(Layer.provide(AllHandlers)) as Layer.Layer<
     never,
     never,
     RpcSerialization.RpcSerialization | HttpRouter.HttpRouter | Requirements<R> | RX
   >
 }
+
+/** Serves pipelines, standard streaming RPCs, and bidirectional capabilities over Effect's WebSocket transport. */
+export const layerWebSocket = <R extends Rpc.Any, EX = never, RX = never>(options: {
+  readonly group: RpcGroup.RpcGroup<R>
+  readonly path: string
+} & ServerOptions<EX, RX>): Layer.Layer<
+  never,
+  never,
+  RpcSerialization.RpcSerialization | HttpRouter.HttpRouter | Requirements<R> | RX
+> => Layer.unwrap(Effect.map(Duplex.makeServer, (duplex) => {
+  const AllHandlers = Layer.effectContext(Effect.gen(function*() {
+    const root = yield* Effect.context<Requirements<R> | RX>()
+    const context = Context.add(root, Duplex.Server, duplex)
+    const pipeline = makePipelineHandlerContext(options.group, context, options)
+    const duplexHandlers = yield* Duplex.Rpcs.toHandlers(Duplex.handlers(duplex))
+    return Context.merge(context, Context.merge(pipeline, duplexHandlers))
+  }))
+  return RpcServer.layerHttp({
+    group: augmentDuplex(options.group),
+    path: options.path as any,
+    protocol: "websocket"
+  }).pipe(
+    Layer.provide(AllHandlers)
+  )
+})) as Layer.Layer<never, never, RpcSerialization.RpcSerialization | HttpRouter.HttpRouter | Requirements<R> | RX>

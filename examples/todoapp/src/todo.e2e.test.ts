@@ -1,9 +1,21 @@
+import { NodeHttpServer } from "@effect/platform-node"
+import * as Context from "effect/Context"
 import * as Effect from "effect/Effect"
+import * as Layer from "effect/Layer"
+import * as Queue from "effect/Queue"
+import * as Stream from "effect/Stream"
+import * as RpcSerialization from "effect/unstable/rpc/RpcSerialization"
+import * as Socket from "effect/unstable/socket/Socket"
+import * as HttpRouter from "effect/unstable/http/HttpRouter"
+import * as HttpServer from "effect/unstable/http/HttpServer"
+import * as PipelineClient from "effect-rpc-pipeline/PipelineClient"
 import { afterAll, beforeAll, describe, expect, it } from "vitest"
+import { createServer } from "node:http"
 import { createTodoHttpServer } from "./todo-server.js"
-import { makeTodoClient } from "./todo-client.js"
+import { makeLiveTodoClient, makeTodoClient } from "./todo-client.js"
 import type { TodoClient } from "./todo-client.js"
 import type { Server } from "node:http"
+import { TodoLiveRoutes } from "./todo-live.js"
 
 describe("TodoMVC end-to-end", () => {
   let server: Server
@@ -72,4 +84,40 @@ describe("TodoMVC end-to-end", () => {
     const state = await Effect.runPromise(client.remove({ id: "missing" }))
     expect(state.todos).toEqual(before.todos)
   })
+
+  it("streams TodoMVC changes over the native WebSocket transport", async () => {
+    const result = await Effect.runPromise(Effect.scoped(Effect.gen(function*() {
+      const ServerLive = HttpRouter.serve(TodoLiveRoutes, {
+        disableLogger: true,
+        disableListenLog: true
+      }).pipe(
+        Layer.provideMerge(NodeHttpServer.layer(createServer, { port: 0 })),
+        Layer.provide(RpcSerialization.layerJson)
+      )
+      const serverContext = yield* Layer.build(ServerLive as Layer.Layer<HttpServer.HttpServer, unknown>)
+      const liveServer = Context.get(serverContext, HttpServer.HttpServer)
+      if (liveServer.address._tag !== "TcpAddress") return yield* Effect.die("Expected TCP test server")
+      const url = `ws://127.0.0.1:${liveServer.address.port}/rpc`
+
+      return yield* Effect.gen(function*() {
+        const todos = yield* makeLiveTodoClient()
+        const events = yield* Queue.unbounded<unknown>()
+        yield* todos.watch().pipe(
+          Stream.runForEach((event) => Queue.offer(events, event)),
+          Effect.forkScoped
+        )
+        const initial = yield* Queue.take(events)
+        yield* todos.add("Live update")
+        const changed = yield* Queue.take(events)
+        return { initial, changed }
+      }).pipe(
+        Effect.provide(PipelineClient.layerWebSocket({ url })),
+        Effect.provide(RpcSerialization.layerJson),
+        Effect.provide(Socket.layerWebSocketConstructorGlobal)
+      )
+    })))
+
+    expect(result.initial).toMatchObject({ version: 0, kind: "reset", todos: [] })
+    expect(result.changed).toMatchObject({ version: 1, kind: "created" })
+  }, 20_000)
 })

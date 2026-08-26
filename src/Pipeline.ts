@@ -2,10 +2,13 @@ import * as Effect from "effect/Effect"
 import * as Effectable from "effect/Effectable"
 import * as Option from "effect/Option"
 import * as Schema from "effect/Schema"
+import type * as Stream from "effect/Stream"
 import type * as Rpc from "effect/unstable/rpc/Rpc"
 import type * as RpcGroup from "effect/unstable/rpc/RpcGroup"
 import type * as RpcMiddleware from "effect/unstable/rpc/RpcMiddleware"
+import type * as RpcClient from "effect/unstable/rpc/RpcClient"
 import type { RpcClientError } from "effect/unstable/rpc/RpcClientError"
+import * as RpcSchema from "effect/unstable/rpc/RpcSchema"
 import type * as Headers from "effect/unstable/http/Headers"
 import { CapabilityGroupTypeId } from "./Capability.js"
 
@@ -39,7 +42,12 @@ export type PipelineTransport = (request: PipelineRequest, options?: { readonly 
   never
 >
 
-type Runtime = { readonly definitionId: string; readonly execute: (request: PipelineRequest) => Effect.Effect<unknown, unknown, never>; nextId(): string }
+type Runtime = {
+  readonly definitionId: string
+  readonly execute: (request: PipelineRequest) => Effect.Effect<unknown, unknown, never>
+  readonly encodeLiteral?: (value: unknown) => unknown
+  nextId(): string
+}
 type Graph = { readonly runtime: Runtime; readonly nodes: ReadonlyArray<PipelineNode>; readonly selection: Expr; readonly discards: ReadonlyArray<string> }
 type InternalOperation = Effect.Effect<any, any, any> & { readonly [OperationTypeId]: true; readonly [PipelineRefTypeId]: true; readonly graph: Graph }
 type CapabilityClient<A, E, R> = A extends { readonly [CapabilityGroupTypeId]: infer Group extends RpcGroup.RpcGroup<any> } ? ClientApi<RpcGroup.Rpcs<Group>, E, R> : unknown
@@ -60,7 +68,13 @@ type PipelineMethod<R extends Rpc.Any, E, Env> = <const Input extends PipelineIn
 >
 
 /** Exact RPC tags become client keys. Dots have no special meaning. */
-export type ClientApi<Rpcs extends Rpc.Any, E = RpcClientError | PipelineProtocolError, Env = never> = { readonly [R in Rpcs as R["_tag"]]: PipelineMethod<R, E, Env> }
+type ClientMethod<R extends Rpc.Any, E, Env> = Rpc.Success<R> extends Stream.Stream<any, any, any>
+  ? RpcClient.RpcClient<R, E>[R["_tag"]]
+  : PipelineMethod<R, E, Env>
+
+export type ClientApi<Rpcs extends Rpc.Any, E = RpcClientError | PipelineProtocolError, Env = never> = {
+  readonly [R in Rpcs as R["_tag"]]: ClientMethod<R, E, Env>
+}
 export type PipelineInput<A> = A | Remote<A, any, any> | (A extends ReadonlyArray<infer I> ? ReadonlyArray<PipelineInput<I>> : A extends Option.Option<infer I> ? Option.Option<PipelineInput<I>> : A extends object ? { readonly [K in keyof A]: PipelineInput<A[K]> } : never)
 export type SelectionInput<A> = A extends { readonly [PipelineRefTypeId]: true } ? A
   : A extends Effect.Effect<any, any, any> ? never
@@ -104,8 +118,13 @@ const encodeValue = (value: unknown, runtime: Runtime, graphs: Graph[]): Expr =>
   if (isOperation(value)) { assertRuntime(runtime, value.graph); graphs.push(value.graph); return value.graph.selection }
   if (Option.isOption(value)) return Option.isNone(value) ? { _tag: "none" } : { _tag: "some", value: encodeValue(value.value, runtime, graphs) }
   if (Array.isArray(value)) return { _tag: "array", values: value.map((item) => encodeValue(item, runtime, graphs)) }
-  if (value !== null && typeof value === "object") return { _tag: "object", entries: Object.keys(value).map((key) => [key, encodeValue((value as any)[key], runtime, graphs)] as const) }
-  return { _tag: "literal", value }
+  if (value !== null && typeof value === "object") {
+    const encoded = runtime.encodeLiteral?.(value)
+    if (encoded !== undefined && encoded !== value) return { _tag: "literal", value: encoded }
+    return { _tag: "object", entries: Object.keys(value).map((key) => [key, encodeValue((value as any)[key], runtime, graphs)] as const) }
+  }
+  const encoded = runtime.encodeLiteral?.(value) ?? value
+  return encoded === undefined ? { _tag: "literal" } : { _tag: "literal", value: encoded }
 }
 const requestFor = (graph: Graph): PipelineRequest => ({ version: 1, definitionId: graph.runtime.definitionId, nodes: graph.nodes, selection: graph.selection, discards: graph.discards })
 
@@ -156,12 +175,31 @@ const makeRemote = <A, E = unknown, R = never>(graph: Graph): Remote<A, E, R> =>
   })
 }
 
-export const makeClient = <Rpcs extends Rpc.Any>(group: RpcGroup.RpcGroup<Rpcs>, definitionId: string, execute: Runtime["execute"]): ClientApi<Rpcs> => {
+export const makeClient = <Rpcs extends Rpc.Any>(
+  group: RpcGroup.RpcGroup<Rpcs>,
+  definitionId: string,
+  execute: Runtime["execute"],
+  options?: {
+    readonly streamClient?: Record<string, (...args: ReadonlyArray<any>) => unknown>
+    readonly encodeLiteral?: Runtime["encodeLiteral"]
+  }
+): ClientApi<Rpcs> => {
   let sequence = 0
-  const runtime: Runtime = { definitionId, execute, nextId: () => `$${sequence++}` }
+  const runtime: Runtime = {
+    definitionId,
+    execute,
+    ...(options?.encodeLiteral === undefined ? {} : { encodeLiteral: options.encodeLiteral }),
+    nextId: () => `$${sequence++}`
+  }
   return new Proxy({}, {
     get(_target, property) {
       if (typeof property !== "string" || !group.requests.has(property)) return undefined
+      const rpc = group.requests.get(property) as unknown as Rpc.AnyWithProps
+      if (RpcSchema.isStreamSchema(rpc.successSchema)) {
+        const method = options?.streamClient?.[property]
+        if (method === undefined) throw new Error(`Streaming RPC ${property} requires an Effect RpcClient transport`)
+        return method
+      }
       return (input?: unknown) => {
         const extra: Graph[] = []
         const payload = encodeValue(input, runtime, extra)

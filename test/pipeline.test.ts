@@ -392,11 +392,11 @@ describe("Effect-native pipeline client", () => {
       key: "missing"
     })
 
-    const client = await Effect.runPromise(PipelineClient.make(App).pipe(
-      Effect.provide(PipelineClient.layerTransport((request) => PipelineServer.handle(App, request, { id: "server" }).pipe(
+    const client = await Effect.runPromise(PipelineClient.make(App, {
+      transport: (request) => PipelineServer.handle(App, request, { id: "server" }).pipe(
         Effect.provideContext(context)
-      )))
-    ))
+      )
+    }))
     const protocolFailure = await Effect.runPromise(Effect.flip(client.lookup({ key: "missing" })))
     expect(protocolFailure).toMatchObject({ _tag: "PipelineProtocolError", code: "InvalidPipeline" })
   })

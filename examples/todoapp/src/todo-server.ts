@@ -15,7 +15,7 @@ const readJson = (request: IncomingMessage): Promise<unknown> => new Promise((re
 
 export const handleTodoPipeline = async (request: unknown, store: TodoStore) => {
   const handlers = makeTodoHandlers(store)
-  const context = await Effect.runPromise(TodoRpcs.toHandlers(handlers))
+  const context = await Effect.runPromise(TodoRpcs.toHandlers(handlers) as Effect.Effect<any>)
   return Effect.runPromise(PipelineServer.handle(TodoRpcs, request as any, { id: "todo-mvc" }).pipe(Effect.provideContext(context)) as any)
 }
 
