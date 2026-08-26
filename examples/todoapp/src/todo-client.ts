@@ -21,13 +21,13 @@ export const makeTodoClient = (url: string): Effect.Effect<TodoClient> => Effect
     remaining: rpc.countTodos({ filter: "active" })
   }).pipe(Effect.map(({ todos, remaining }) => makeTodoState(todos, filter, remaining)))
 
-  const mutateThenQuery = (mutation: Pipeline.Remote<unknown>, filter: TodoFilter) => Pipeline.zipRight(
-    mutation,
-    Pipeline.all({
+  const mutateThenQuery = (mutation: Pipeline.Remote<unknown>, filter: TodoFilter) => mutation.pipe(
+    Pipeline.andThen(() => ({
       todos: rpc.listTodos({ filter }),
       remaining: rpc.countTodos({ filter: "active" })
-    })
-  ).pipe(Effect.map(({ todos, remaining }) => makeTodoState(todos, filter, remaining)))
+    })),
+    Effect.map(({ todos, remaining }) => makeTodoState(todos, filter, remaining))
+  )
 
   return {
     snapshot: (filter = "all") => query(filter),

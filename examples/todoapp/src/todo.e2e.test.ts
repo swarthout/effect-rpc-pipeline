@@ -66,7 +66,8 @@ describe("TodoMVC end-to-end", () => {
   })
 
   it("rejects blank titles and reports missing todos", async () => {
-    await expect(Effect.runPromise(client.add("   "))).rejects.toThrow()
+    const invalid = await Effect.runPromise(Effect.flip(client.add("   ")))
+    expect(invalid).toMatchObject({ _tag: "InvalidTodoTitle", title: "   " })
     const before = await Effect.runPromise(client.snapshot())
     const state = await Effect.runPromise(client.remove({ id: "missing" }))
     expect(state.todos).toEqual(before.todos)

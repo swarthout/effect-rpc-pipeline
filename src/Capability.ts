@@ -1,3 +1,6 @@
+import * as Context from "effect/Context"
+import * as Effect from "effect/Effect"
+import type * as Rpc from "effect/unstable/rpc/Rpc"
 import type * as RpcGroup from "effect/unstable/rpc/RpcGroup"
 import * as Schema from "effect/Schema"
 
@@ -8,7 +11,9 @@ export type CapabilityInstance<Group extends RpcGroup.RpcGroup<any> = RpcGroup.R
   readonly capabilityId: string
   readonly group: Group
   readonly [CapabilityGroupTypeId]: Group
-  readonly handlers: RpcGroup.HandlersFrom<RpcGroup.Rpcs<Group>>
+  readonly context: Context.Context<
+    Rpc.ToHandler<RpcGroup.Rpcs<Group>> | Rpc.Middleware<RpcGroup.Rpcs<Group>> | Rpc.ServicesServer<RpcGroup.Rpcs<Group>>
+  >
 }
 
 export type CapabilityDefinition<Group extends RpcGroup.RpcGroup<any> = RpcGroup.RpcGroup<any>> = {
@@ -16,8 +21,23 @@ export type CapabilityDefinition<Group extends RpcGroup.RpcGroup<any> = RpcGroup
   readonly id: string
   readonly group: Group
   readonly schema: Schema.declare<CapabilityInstance<Group>>
-  readonly make: (handlers: RpcGroup.HandlersFrom<RpcGroup.Rpcs<Group>>) => CapabilityInstance<Group>
-  readonly of: (handlers: RpcGroup.HandlersFrom<RpcGroup.Rpcs<Group>>) => CapabilityInstance<Group>
+  readonly fromHandlers: {
+    <Handlers extends RpcGroup.HandlersFrom<RpcGroup.Rpcs<Group>>>(handlers: Handlers): Effect.Effect<
+      CapabilityInstance<Group>,
+      never,
+      | RpcGroup.HandlersServices<RpcGroup.Rpcs<Group>, Handlers>
+      | Rpc.Middleware<RpcGroup.Rpcs<Group>>
+      | Rpc.ServicesServer<RpcGroup.Rpcs<Group>>
+    >
+    <Handlers extends RpcGroup.HandlersFrom<RpcGroup.Rpcs<Group>>, E, R>(handlers: Effect.Effect<Handlers, E, R>): Effect.Effect<
+      CapabilityInstance<Group>,
+      E,
+      | R
+      | RpcGroup.HandlersServices<RpcGroup.Rpcs<Group>, Handlers>
+      | Rpc.Middleware<RpcGroup.Rpcs<Group>>
+      | Rpc.ServicesServer<RpcGroup.Rpcs<Group>>
+    >
+  }
 }
 
 export const TypeId = Symbol.for("effect-rpc-pipeline/Capability")
@@ -29,8 +49,17 @@ export const make = <Group extends RpcGroup.RpcGroup<any>>(id: string, group: Gr
     id,
     group,
     schema: Schema.declare<CapabilityInstance<Group>>((value): value is CapabilityInstance<Group> => isInstance(value)),
-    make: (handlers) => ({ _tag: "CapabilityInstance", capabilityId: id, group, [CapabilityGroupTypeId]: group, handlers }),
-    of: (handlers) => ({ _tag: "CapabilityInstance", capabilityId: id, group, [CapabilityGroupTypeId]: group, handlers })
+    fromHandlers: (handlers: unknown) => Effect.gen(function*() {
+      const ambient = yield* Effect.context<any>()
+      const handlerContext = yield* group.toHandlers(handlers as any)
+      return {
+        _tag: "CapabilityInstance" as const,
+        capabilityId: id,
+        group,
+        [CapabilityGroupTypeId]: group,
+        context: Context.merge(ambient, handlerContext)
+      }
+    }) as any
   }
   return descriptor
 }

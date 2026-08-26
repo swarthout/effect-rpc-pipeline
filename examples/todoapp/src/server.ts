@@ -32,7 +32,7 @@ const UserRepository = {
 
 export const AppHandlers = AppRpcs.of({
   authenticate: ({ token }) => Effect.gen(function*() {
-    return AuthedCapability.of({
+    return yield* AuthedCapability.fromHandlers({
       getUserId: () => Effect.succeed(token === "demo-token" ? "usr_100" : "usr_101"),
       getFriendIds: () => Effect.succeed(["usr_101", "usr_102", "usr_103"])
     })
@@ -57,5 +57,5 @@ export const ServerLive = PipelineServer.layerHttp({
 
 export const handlePipeline = async (request: unknown) => {
   const context = await Effect.runPromise(AppRpcs.toHandlers(AppHandlers))
-  return Effect.runPromise(PipelineServer.handle(AppRpcs, request as any, context, { id: "example-app" }) as any)
+  return Effect.runPromise(PipelineServer.handle(AppRpcs, request as any, { id: "example-app" }).pipe(Effect.provideContext(context)) as any)
 }

@@ -34,6 +34,29 @@ const ServerLive = PipelineServer.layerHttp({
 
 The same group, handler layer, schemas, services, and RPC middleware remain usable by a standard Effect RPC server.
 
+Middleware keeps its native Effect meaning. A middleware can provide request-scoped services such as `CurrentUser`, require application services, and add a schema-backed error to every protected RPC:
+
+```ts
+class CurrentUser extends Context.Service<CurrentUser, User>()("app/CurrentUser") {}
+class Unauthorized extends Schema.TaggedError<Unauthorized>()("Unauthorized", {
+  reason: Schema.String
+}) {}
+class Auth extends RpcMiddleware.Service<Auth, {
+  provides: CurrentUser
+  requires: UserRepository
+}>()("app/Auth", { error: Unauthorized }) {}
+
+const PrivateRpcs = RpcGroup.make(
+  Rpc.make("me", { success: User })
+).middleware(Auth)
+
+const PrivateLive = PrivateRpcs.toLayer({
+  me: () => CurrentUser
+})
+```
+
+`CurrentUser` is supplied around each handler by `Auth`; it is a server requirement and never leaks into the client Effect's requirements.
+
 ## Use calls as Effects or remote values
 
 ```ts
@@ -48,6 +71,22 @@ const result = yield* Pipeline.all({
   user,
   profile: rpc.getProfile({ id: user.id })
 })
+```
+
+For Layer-based applications, provide the transport as an Effect service:
+
+```ts
+const rpc = yield* PipelineClient.make(AppRpcs).pipe(
+  Effect.provide(PipelineClient.layerHttp({ url: "/rpc" }))
+)
+```
+
+`RpcClient.withHeaders` works on a final remote value, and required `RpcMiddleware.layerClient` implementations are captured when the pipeline client is constructed. A client middleware shared by several nodes runs once around the complete batch.
+
+```ts
+const result = yield* Pipeline.all({ me: rpc.me(), todos: rpc.listTodos() }).pipe(
+  RpcClient.withHeaders({ authorization: `Bearer ${token}` })
+)
 ```
 
 `Pipeline.all` replaces a special `$batch` call: the value being yielded is the batch boundary, while every dependency remains visible in the graph.
@@ -65,17 +104,21 @@ const greeting = yield* Pipeline.map(rpc.findUser({ email }), (user) =>
 )
 ```
 
-For mutations that have no data dependency, express ordering explicitly and keep the query parallel:
+Build a client-selected mutation response with `Pipeline.andThen`. The callback receives the symbolic mutation result, and every query it introduces runs after the mutation. Independent queries in the response run in parallel:
 
 ```ts
-const state = yield* Pipeline.zipRight(
-  rpc.addTodo({ title }),
-  Pipeline.all({
+const state = yield* rpc.addTodo({ title }).pipe(
+  Pipeline.andThen((created) => ({
+    created,
     todos: rpc.listTodos({ filter: "all" }),
     remaining: rpc.countTodos({ filter: "active" })
-  })
+  }))
 )
 ```
+
+The callback runs locally while building the request, so its argument is a `Remote<T>`, not a concrete value. It can be projected, passed to other RPCs, mapped when it is an array or `Option`, and included in the response. It cannot be inspected with ordinary branching or arbitrary local computation until the final pipeline is yielded.
+
+Repeated `Pipeline.andThen` calls create serial phases. Ordering is guaranteed within the pipeline request, but it does not by itself open a database transaction or provide snapshot isolation; those remain application-level Effect services.
 
 ## Capability authentication
 
@@ -92,8 +135,26 @@ const AppRpcs = RpcGroup.make(
   Rpc.make("authenticate", {
     payload: { token: Schema.String },
     success: Session.schema
+  }),
+  Rpc.make("getProfile", {
+    payload: { id: Schema.String },
+    success: Profile
   })
 )
+
+const AppHandlers = AppRpcs.of({
+  authenticate: ({ token }) => Effect.gen(function*() {
+    const user = yield* Users.authenticate(token)
+    return yield* Session.fromHandlers({
+      whoami: () => CurrentUser,
+      friendIds: () => Effect.gen(function*() {
+        const current = yield* CurrentUser
+        return yield* Friends.forUser(current.id)
+      })
+    }).pipe(Effect.provideService(CurrentUser, user))
+  }),
+  getProfile: ({ id }) => Profiles.get(id)
+})
 
 const session = rpc.authenticate({ token })
 const result = yield* Pipeline.all({
@@ -101,6 +162,24 @@ const result = yield* Pipeline.all({
   friends: Pipeline.map(session.friendIds(), (id) => rpc.getProfile({ id }))
 })
 ```
+
+`Session.fromHandlers` mirrors `RpcGroup.toHandlers`: it returns an Effect whose requirements are inferred from the handlers, then captures the provided Context in the batch-local capability. Capability calls use the original RPC schemas and middleware.
+
+## Errors and requirements
+
+A remote call exposes the union of every operation that may execute in its graph:
+
+```ts
+const account = rpc.findAccount({ email })
+const invoices = rpc.listInvoices({ accountId: account.id })
+
+// Effect<ReadonlyArray<Invoice>,
+//   AccountNotFound | InvoiceError | Unauthorized |
+//   AuthClientError | RpcClientError | PipelineProtocolError,
+//   ClientSchemaServices>
+```
+
+Domain and middleware failures cross the boundary without a wrapper, so `Effect.catchTag` and `Effect.catchTags` work normally. Transport failures use Effect's `RpcClientError`; malformed or incompatible graphs use the schema-backed `PipelineProtocolError`. `Pipeline.all`, `Pipeline.map`, dependent payloads, capability calls, and `Pipeline.andThen` all accumulate their nested error and client-schema requirement unions.
 
 Plain-object authentication is supported as well: project fields such as `rpc.authenticate(...).id` and pass them into other calls.
 
