@@ -3,24 +3,52 @@ import * as Effect from "effect/Effect"
 import * as Option from "effect/Option"
 import * as Rpc from "effect/unstable/rpc/Rpc"
 import * as RpcGroup from "effect/unstable/rpc/RpcGroup"
+import type * as RpcSerialization from "effect/unstable/rpc/RpcSerialization"
 import * as RpcServer from "effect/unstable/rpc/RpcServer"
 import type * as Headers from "effect/unstable/http/Headers"
+import type * as HttpRouter from "effect/unstable/http/HttpRouter"
+import * as SqlClient from "effect/unstable/sql/SqlClient"
+import type { SqlError } from "effect/unstable/sql/SqlError"
 import * as Schema from "effect/Schema"
 import * as Layer from "effect/Layer"
 import type { CapabilityInstance } from "./Capability.js"
 import { isInstance } from "./Capability.js"
 import { PipelineProtocolError, type Expr, type PipelineNode, type PipelineRequest } from "./Pipeline.js"
 import type { PipelineResponse } from "./PipelineClient.js"
+import { makeScope, RequestScope } from "./RequestBatching.js"
 
 export { PipelineProtocolError }
 
 type ServerDefinition<R extends Rpc.Any> = { readonly id: string; readonly root: RpcGroup.RpcGroup<R> }
-type RequestMetadata = {
+export type RequestMetadata = {
   readonly client: Rpc.ServerClient
   readonly requestId: unknown
   readonly headers: Headers.Headers
 }
 export type Requirements<R extends Rpc.Any> = Rpc.ToHandler<R> | Rpc.Middleware<R> | Rpc.ServicesServer<R>
+
+export interface ExecutionContext<R extends Rpc.Any> {
+  readonly group: RpcGroup.RpcGroup<R>
+  readonly request: PipelineRequest
+  readonly metadata: RequestMetadata
+}
+
+/** Wraps raw pipeline execution before failures are encoded for transport. */
+export interface AroundExecution<EX = never, RX = never> {
+  <A, E, R>(
+    execution: Effect.Effect<A, E, R>,
+    context: ExecutionContext<any>
+  ): Effect.Effect<A, E | EX, R | RX>
+}
+
+export interface ServerOptions<EX = never, RX = never> {
+  readonly id?: string
+  readonly aroundExecution?: AroundExecution<EX, RX>
+}
+
+/** Runs the complete pipeline on Effect SQL's transaction connection. */
+export const sqlTransaction: AroundExecution<SqlError, SqlClient.SqlClient> =
+  (execution) => Effect.flatMap(SqlClient.SqlClient, (sql) => sql.withTransaction(execution))
 
 const PathSchema = Schema.Array(Schema.Union([Schema.String, Schema.Number]))
 export const ExprSchema: Schema.Schema<Expr> = Schema.suspend(() => Schema.Union([
@@ -108,7 +136,7 @@ const refsIn = (expr: Expr, out = new Set<string>()): Set<string> => {
   return out
 }
 
-const executeNode = <R extends Rpc.Any>(definition: ServerDefinition<R>, node: PipelineNode, values: Map<string, unknown>, context: Context.Context<Requirements<R>>, metadata: RequestMetadata, item?: unknown, nodeIndex = new Map<string, PipelineNode>()): Effect.Effect<void, unknown, any> => {
+const executeNode = <R extends Rpc.Any>(definition: ServerDefinition<R>, node: PipelineNode, values: Map<string, unknown>, context: Context.Context<any>, metadata: RequestMetadata, item?: unknown, nodeIndex = new Map<string, PipelineNode>()): Effect.Effect<void, unknown, any> => {
   const required = node._tag === "map" ? [...refsIn(node.source)] : dependencies(node)
   for (const dependency of required) if (!values.has(dependency)) return Effect.fail(new PipelineProtocolError(`Unresolved dependency ${dependency}`, "InvalidReference"))
   if (node._tag === "map") {
@@ -176,14 +204,19 @@ const executeNode = <R extends Rpc.Any>(definition: ServerDefinition<R>, node: P
   )
 }
 
-const handleWithContext = <R extends Rpc.Any>(group: RpcGroup.RpcGroup<R>, request: PipelineRequest, context: Context.Context<Requirements<R>>, metadata: RequestMetadata, options?: { readonly id?: string }): Effect.Effect<PipelineResponse, never, never> => {
+const executePipeline = <R extends Rpc.Any>(
+  group: RpcGroup.RpcGroup<R>,
+  request: PipelineRequest,
+  context: Context.Context<any>,
+  metadata: RequestMetadata,
+  options?: { readonly id?: string }
+): Effect.Effect<unknown, unknown, never> => {
   const definition: ServerDefinition<R> = { id: options?.id ?? "default", root: group }
-  const failure = (error: unknown): Effect.Effect<PipelineResponse> => Effect.succeed({ _tag: "Failure", error })
-  if (request.version !== 1 || request.definitionId !== definition.id) return failure(new PipelineProtocolError("Unsupported pipeline definition or version"))
-  if (request.nodes.length > 1000) return failure(new PipelineProtocolError("Pipeline node limit exceeded", "LimitExceeded"))
+  if (request.version !== 1 || request.definitionId !== definition.id) return Effect.fail(new PipelineProtocolError("Unsupported pipeline definition or version"))
+  if (request.nodes.length > 1000) return Effect.fail(new PipelineProtocolError("Pipeline node limit exceeded", "LimitExceeded"))
   const values = new Map<string, unknown>()
   const nodeIndex = new Map(request.nodes.map((node) => [node.id, node]))
-  if (nodeIndex.size !== request.nodes.length) return failure(new PipelineProtocolError("Duplicate pipeline node id", "InvalidPipeline"))
+  if (nodeIndex.size !== request.nodes.length) return Effect.fail(new PipelineProtocolError("Duplicate pipeline node id", "InvalidPipeline"))
   const pending = request.nodes.filter((node) => !(
     node._tag === "call" && (containsItem(node.payload) || (node.target ? containsItem(node.target) : false))
   ))
@@ -201,44 +234,75 @@ const handleWithContext = <R extends Rpc.Any>(group: RpcGroup.RpcGroup<R>, reque
   }
   return executeReady().pipe(
     Effect.flatMap(() => Effect.try({
-      try: (): PipelineResponse => ({ _tag: "Success", value: evalExpr(request.selection, values) }),
+      try: () => evalExpr(request.selection, values),
       catch: (error) => error
-    })),
+    }))
+  ) as Effect.Effect<unknown, unknown, never>
+}
+
+const handleWithContext = <R extends Rpc.Any, EX, RX>(
+  group: RpcGroup.RpcGroup<R>,
+  request: PipelineRequest,
+  context: Context.Context<Requirements<R> | RX>,
+  metadata: RequestMetadata,
+  options?: ServerOptions<EX, RX>
+): Effect.Effect<PipelineResponse, never, never> => {
+  const scopedContext = Context.add(context, RequestScope, makeScope())
+  const execution = executePipeline(
+    group,
+    request,
+    scopedContext,
+    metadata,
+    options?.id === undefined ? undefined : { id: options.id }
+  )
+  const wrapped = options?.aroundExecution === undefined
+    ? execution
+    : options.aroundExecution(execution, { group, request, metadata })
+  return wrapped.pipe(
+    Effect.provideContext(scopedContext),
+    Effect.map((value): PipelineResponse => ({ _tag: "Success", value })),
     Effect.catch((error): Effect.Effect<PipelineResponse> => Effect.succeed({ _tag: "Failure", error }))
-  ) as Effect.Effect<PipelineResponse, never, never>
+  )
 }
 
 /** Executes a pipeline using normal Effect RPC handlers and middleware from the environment. */
-export const handle = <R extends Rpc.Any>(
+export const handle = <R extends Rpc.Any, EX = never, RX = never>(
   group: RpcGroup.RpcGroup<R>,
   request: PipelineRequest,
-  options?: { readonly id?: string; readonly metadata?: RequestMetadata }
-): Effect.Effect<PipelineResponse, never, Requirements<R>> => Effect.context<Requirements<R>>().pipe(Effect.flatMap((context) =>
+  options?: ServerOptions<EX, RX> & { readonly metadata?: RequestMetadata }
+): Effect.Effect<PipelineResponse, never, Requirements<R> | RX> => Effect.context<Requirements<R> | RX>().pipe(Effect.flatMap((context) =>
   handleWithContext(group, request, context, options?.metadata ?? {
     client: new Rpc.ServerClient(0),
     requestId: "pipeline",
     headers: {} as Headers.Headers
-  }, options?.id === undefined ? undefined : { id: options.id })
+  }, options)
 ))
 
 export const augment = <R extends Rpc.Any>(group: RpcGroup.RpcGroup<R>): RpcGroup.RpcGroup<R | typeof PipelineRpc> => group.add(PipelineRpc)
 
-export const layer = <R extends Rpc.Any>(group: RpcGroup.RpcGroup<R>, options?: { readonly id?: string }): Layer.Layer<Rpc.ToHandler<typeof PipelineRpc>, never, Requirements<R>> =>
+export const layer = <R extends Rpc.Any, EX = never, RX = never>(group: RpcGroup.RpcGroup<R>, options?: ServerOptions<EX, RX>): Layer.Layer<Rpc.ToHandler<typeof PipelineRpc>, never, Requirements<R> | RX> =>
   Layer.effectContext(Effect.gen(function*() {
-    const context = yield* Effect.context<Requirements<R>>()
+    const context = yield* Effect.context<Requirements<R> | RX>()
     const handler = (request: PipelineRequest, metadata: RequestMetadata) => handleWithContext(group, request, context, metadata, options)
     return Context.makeUnsafe(new Map([[PipelineRpc.key, { tag: PipelineRpc._tag, handler, context }]]))
   }))
 
-export const layerHttp = <R extends Rpc.Any>(options: {
+export const layerHttp = <R extends Rpc.Any, EX = never, RX = never>(options: {
   readonly group: RpcGroup.RpcGroup<R>
   readonly path: string
-  readonly id?: string
   readonly protocol?: "http" | "websocket"
-}) => {
+} & ServerOptions<EX, RX>): Layer.Layer<
+  never,
+  never,
+  RpcSerialization.RpcSerialization | HttpRouter.HttpRouter | Requirements<R> | RX
+> => {
   return RpcServer.layerHttp({
     group: augment(options.group),
     path: options.path as any,
     protocol: options.protocol ?? "http"
-  }).pipe(Layer.provide(layer(options.group, options.id === undefined ? undefined : { id: options.id })))
+  }).pipe(Layer.provide(layer<R, EX, RX>(options.group, options))) as Layer.Layer<
+    never,
+    never,
+    RpcSerialization.RpcSerialization | HttpRouter.HttpRouter | Requirements<R> | RX
+  >
 }

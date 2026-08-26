@@ -13,7 +13,8 @@
     "./Pipeline": { "types": "./dist/Pipeline.d.mts", "import": "./dist/Pipeline.mjs" },
     "./PipelineClient": { "types": "./dist/PipelineClient.d.mts", "import": "./dist/PipelineClient.mjs" },
     "./PipelineServer": { "types": "./dist/PipelineServer.d.mts", "import": "./dist/PipelineServer.mjs" },
-    "./Capability": { "types": "./dist/Capability.d.mts", "import": "./dist/Capability.mjs" }
+    "./Capability": { "types": "./dist/Capability.d.mts", "import": "./dist/Capability.mjs" },
+    "./RequestBatching": { "types": "./dist/RequestBatching.d.mts", "import": "./dist/RequestBatching.mjs" }
   },
   "scripts": {
     "build": "tsdown --config-loader native",

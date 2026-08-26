@@ -1,6 +1,11 @@
+import * as Cache from "effect/Cache"
 import * as Context from "effect/Context"
 import * as Effect from "effect/Effect"
+import * as Exit from "effect/Exit"
+import * as Layer from "effect/Layer"
 import * as Option from "effect/Option"
+import * as Request from "effect/Request"
+import * as RequestResolver from "effect/RequestResolver"
 import * as Schema from "effect/Schema"
 import * as Headers from "effect/unstable/http/Headers"
 import * as Rpc from "effect/unstable/rpc/Rpc"
@@ -8,11 +13,13 @@ import * as RpcClient from "effect/unstable/rpc/RpcClient"
 import type { RpcClientError } from "effect/unstable/rpc/RpcClientError"
 import * as RpcGroup from "effect/unstable/rpc/RpcGroup"
 import * as RpcMiddleware from "effect/unstable/rpc/RpcMiddleware"
+import * as SqlClient from "effect/unstable/sql/SqlClient"
 import { describe, expect, expectTypeOf, it } from "vitest"
 import * as Capability from "../src/Capability.js"
 import * as Pipeline from "../src/Pipeline.js"
 import * as PipelineClient from "../src/PipelineClient.js"
 import * as PipelineServer from "../src/PipelineServer.js"
+import * as RequestBatching from "../src/RequestBatching.js"
 
 const local = async <Rpcs extends Rpc.Any>(group: RpcGroup.RpcGroup<Rpcs>, handlers: any, id = "default") => {
   const context = await Effect.runPromise(group.toHandlers(handlers) as Effect.Effect<any>)
@@ -415,7 +422,303 @@ describe("Effect-native pipeline client", () => {
   })
 })
 
+describe("request batching and transactional execution", () => {
+  it("batches and deduplicates mapped downstream requests", async () => {
+    class GetUser extends Request.TaggedClass("GetUser")<
+      { readonly id: string },
+      string
+    > {}
+
+    const batches: Array<ReadonlyArray<string>> = []
+    const resolver = RequestResolver.make<GetUser>((entries) => Effect.sync(() => {
+      batches.push(entries.map((entry) => entry.request.id))
+      for (const entry of entries) {
+        entry.completeUnsafe(Exit.succeed(`user:${entry.request.id}`))
+      }
+    }))
+    const UserCache = RequestBatching.cache(Effect.succeed(resolver), { capacity: 32 })
+    expectTypeOf<Effect.Services<typeof UserCache>>().toEqualTypeOf<RequestBatching.RequestScope>()
+
+    const App = RpcGroup.make(
+      Rpc.make("userIds", { success: Schema.Array(Schema.String) }),
+      Rpc.make("user", { payload: { id: Schema.String }, success: Schema.String })
+    ).middleware(RequestBatching.Middleware)
+    const handlers = await Effect.runPromise(App.toHandlers({
+      userIds: () => Effect.succeed(["a", "b", "a", "c", "b"]),
+      user: ({ id }: { readonly id: string }) => Effect.flatMap(UserCache, Cache.get(new GetUser({ id })))
+    }))
+    const batching = await Effect.runPromise(Layer.build(RequestBatching.layer).pipe(Effect.scoped))
+    const context = Context.merge(handlers, batching)
+    const client = await Effect.runPromise(PipelineClient.make(App, {
+      transport: (request) => PipelineServer.handle(App, request).pipe(Effect.provideContext(context))
+    }))
+
+    const users = await Effect.runPromise(Pipeline.map(client.userIds(), (id) => client.user({ id })))
+    expect(users).toEqual(["user:a", "user:b", "user:a", "user:c", "user:b"])
+    expect(batches).toEqual([["a", "b", "c"]])
+  })
+
+  it("reuses sequential reads and observes mutations after invalidation", async () => {
+    class GetValue extends Request.TaggedClass("GetValue")<
+      { readonly id: string },
+      string
+    > {}
+
+    const values = new Map([["item", "before"]])
+    let loads = 0
+    const resolver = RequestResolver.make<GetValue>((entries) => Effect.sync(() => {
+      loads++
+      for (const entry of entries) {
+        entry.completeUnsafe(Exit.succeed(values.get(entry.request.id)!))
+      }
+    }))
+    const ValueCache = RequestBatching.cache(resolver, { capacity: 8 })
+    const requestFor = (id: string) => new GetValue({ id })
+
+    const App = RpcGroup.make(
+      Rpc.make("getValue", { payload: { id: Schema.String }, success: Schema.String }),
+      Rpc.make("setValue", { payload: { id: Schema.String, value: Schema.String }, success: Schema.Void })
+    ).middleware(RequestBatching.Middleware)
+    const handlers = await Effect.runPromise(App.toHandlers({
+      getValue: ({ id }: { readonly id: string }) => Effect.flatMap(ValueCache, Cache.get(requestFor(id))),
+      setValue: ({ id, value }: { readonly id: string; readonly value: string }) => Effect.gen(function*() {
+        values.set(id, value)
+        const cache = yield* ValueCache
+        yield* Cache.invalidate(cache, requestFor(id))
+      })
+    }))
+    const batching = await Effect.runPromise(Layer.build(RequestBatching.layer).pipe(Effect.scoped))
+    const context = Context.merge(handlers, batching)
+    const client = await Effect.runPromise(PipelineClient.make(App, {
+      transport: (request) => PipelineServer.handle(App, request).pipe(Effect.provideContext(context))
+    }))
+
+    const firstPhase = client.getValue({ id: "item" }).pipe(
+      Pipeline.andThen((before) => ({
+        before,
+        repeated: client.getValue({ id: "item" })
+      }))
+    )
+    const mutationPhase = firstPhase.pipe(
+      Pipeline.andThen(({ before, repeated }) => ({
+        before,
+        repeated,
+        changed: client.setValue({ id: "item", value: "after" })
+      }))
+    )
+    const result = await Effect.runPromise(mutationPhase.pipe(
+      Pipeline.andThen(({ before, repeated }) => ({
+        before,
+        repeated,
+        after: client.getValue({ id: "item" })
+      }))
+    ))
+
+    expect(result).toEqual({ before: "before", repeated: "before", after: "after" })
+    expect(loads).toBe(2)
+  })
+
+  it("partitions one pipeline by authentication context", async () => {
+    class Tenant extends Context.Service<Tenant, string>()("test/BatchTenant") {}
+    class GetTenantValue extends Request.TaggedClass("GetTenantValue")<
+      { readonly id: string },
+      string,
+      never,
+      Tenant
+    > {}
+
+    const batches: Array<string> = []
+    const resolver = RequestResolver.make<GetTenantValue>((entries) => Effect.sync(() => {
+      const tenant = Context.get(entries[0]!.context, Tenant)
+      batches.push(tenant)
+      for (const entry of entries) {
+        entry.completeUnsafe(Exit.succeed(`${tenant}:${entry.request.id}`))
+      }
+    }))
+    const TenantCache = RequestBatching.cache(resolver, {
+      capacity: 8,
+      partition: Tenant
+    })
+    expectTypeOf<Effect.Services<typeof TenantCache>>().toEqualTypeOf<RequestBatching.RequestScope | Tenant>()
+    const App = RpcGroup.make(Rpc.make("tenantValue", {
+      payload: { tenant: Schema.String, id: Schema.String },
+      success: Schema.String
+    })).middleware(RequestBatching.Middleware)
+    const handlers = await Effect.runPromise(App.toHandlers({
+      tenantValue: ({ tenant, id }: { readonly tenant: string; readonly id: string }) => Effect.flatMap(
+        TenantCache,
+        Cache.get(new GetTenantValue({ id }))
+      ).pipe(Effect.provideService(Tenant, tenant))
+    }))
+    const batching = await Effect.runPromise(Layer.build(RequestBatching.layer).pipe(Effect.scoped))
+    const context = Context.merge(handlers, batching)
+    const client = await Effect.runPromise(PipelineClient.make(App, {
+      transport: (request) => PipelineServer.handle(App, request).pipe(Effect.provideContext(context))
+    }))
+
+    expect(await Effect.runPromise(Pipeline.all({
+      alice: client.tenantValue({ tenant: "alice", id: "same" }),
+      bob: client.tenantValue({ tenant: "bob", id: "same" })
+    }))).toEqual({ alice: "alice:same", bob: "bob:same" })
+    expect(new Set(batches)).toEqual(new Set(["alice", "bob"]))
+  })
+
+  it("never batches concurrent pipeline requests into the same resolver context", async () => {
+    class Tenant extends Context.Service<Tenant, string>()("test/RequestTenant") {}
+    class LoadTenant extends Request.TaggedClass("LoadRequestTenant")<
+      { readonly id: string },
+      string,
+      never,
+      Tenant
+    > {}
+    const seen: Array<{ readonly tenant: string; readonly size: number }> = []
+    const resolver = RequestResolver.make<LoadTenant>((entries) => Effect.sync(() => {
+      const tenant = Context.get(entries[0]!.context, Tenant)
+      seen.push({ tenant, size: entries.length })
+      for (const entry of entries) entry.completeUnsafe(Exit.succeed(`${tenant}:${entry.request.id}`))
+    }))
+    const TenantCache = RequestBatching.cache(resolver, { capacity: 8 })
+    const App = RpcGroup.make(Rpc.make("loadTenant", {
+      payload: { tenant: Schema.String },
+      success: Schema.String
+    })).middleware(RequestBatching.Middleware)
+    const handlers = await Effect.runPromise(App.toHandlers({
+      loadTenant: ({ tenant }: { readonly tenant: string }) => Effect.flatMap(
+        TenantCache,
+        Cache.get(new LoadTenant({ id: "same" }))
+      ).pipe(Effect.provideService(Tenant, tenant))
+    }))
+    const batching = await Effect.runPromise(Layer.build(RequestBatching.layer).pipe(Effect.scoped))
+    const context = Context.merge(handlers, batching)
+    const client = await Effect.runPromise(PipelineClient.make(App, {
+      transport: (request) => PipelineServer.handle(App, request).pipe(Effect.provideContext(context))
+    }))
+
+    expect(await Effect.runPromise(Effect.all([
+      client.loadTenant({ tenant: "alice" }),
+      client.loadTenant({ tenant: "bob" })
+    ], { concurrency: "unbounded" }))).toEqual(["alice:same", "bob:same"])
+    expect(new Set(seen.map(({ tenant }) => tenant))).toEqual(new Set(["alice", "bob"]))
+    expect(seen.every(({ size }) => size === 1)).toBe(true)
+  })
+
+  it("wraps raw failures so transaction hooks commit and roll back correctly", async () => {
+    type TestConnection = { readonly id: string; readonly before: number }
+    class TransactionConnection extends Context.Service<
+      TransactionConnection,
+      readonly [connection: TestConnection, depth: number]
+    >()("test/TransactionConnection") {}
+    class MutationFailed extends Schema.TaggedError<MutationFailed>()("MutationFailed", {}) {}
+    const App = RpcGroup.make(
+      Rpc.make("increment", { success: Schema.Number }),
+      Rpc.make("incrementAndFail", { success: Schema.Never, error: MutationFailed }),
+      Rpc.make("readTransaction", {
+        success: Schema.Struct({ value: Schema.Number, transaction: Schema.String })
+      })
+    )
+    let value = 0
+    const handlers = await Effect.runPromise(App.toHandlers({
+      increment: () => Effect.sync(() => ++value),
+      incrementAndFail: () => Effect.andThen(
+        Effect.sync(() => { value++ }),
+        Effect.fail(new MutationFailed())
+      ),
+      // Effect SQL similarly hides its internal transaction-connection service
+      // behind the SqlClient API while reading it dynamically at execution.
+      readTransaction: () => Effect.map(TransactionConnection, ([connection]) => ({
+        value,
+        transaction: connection.id
+      })) as Effect.Effect<{
+        readonly value: number
+        readonly transaction: string
+      }>
+    }))
+    const events: Array<string> = []
+    let transactionSequence = 0
+    const withTransaction = SqlClient.makeWithTransaction({
+      transactionService: TransactionConnection,
+      spanAttributes: [],
+      acquireConnection: Effect.sync(() => [
+        undefined,
+        { id: `tx-${++transactionSequence}`, before: value }
+      ] as const),
+      begin: (connection) => Effect.sync(() => { events.push(`begin:${connection.id}`) }),
+      savepoint: (connection, depth) => Effect.sync(() => { events.push(`savepoint:${connection.id}:${depth}`) }),
+      commit: (connection) => Effect.sync(() => { events.push(`commit:${connection.id}`) }),
+      rollback: (connection) => Effect.sync(() => {
+        value = connection.before
+        events.push(`rollback:${connection.id}`)
+      }),
+      rollbackSavepoint: (connection, depth) => Effect.sync(() => {
+        events.push(`rollback-savepoint:${connection.id}:${depth}`)
+      })
+    })
+    const sql = {
+      withTransaction
+    } as SqlClient.SqlClient
+    const client = await Effect.runPromise(PipelineClient.make(App, {
+      transport: (request) => PipelineServer.handle(App, request, {
+        aroundExecution: PipelineServer.sqlTransaction
+      }).pipe(
+        Effect.provideService(SqlClient.SqlClient, sql),
+        Effect.provideContext(handlers)
+      )
+    }))
+
+    const success = await Effect.runPromise(client.increment().pipe(
+      Pipeline.andThen(() => client.readTransaction())
+    ))
+    expect(success).toEqual({ value: 1, transaction: "tx-1" })
+
+    const failure = await Effect.runPromise(Effect.flip(client.incrementAndFail()))
+    expect(failure).toMatchObject({ _tag: "MutationFailed" })
+    expect(value).toBe(1)
+    expect(events).toEqual(["begin:tx-1", "commit:tx-1", "begin:tx-2", "rollback:tx-2"])
+  })
+})
+
 describe("capability authentication", () => {
+  it("shares request-scoped batches across mapped capability calls", async () => {
+    class LoadName extends Request.TaggedClass("LoadCapabilityName")<
+      { readonly id: string },
+      string
+    > {}
+    const batches: Array<ReadonlyArray<string>> = []
+    const resolver = RequestResolver.make<LoadName>((entries) => Effect.sync(() => {
+      batches.push(entries.map((entry) => entry.request.id))
+      for (const entry of entries) {
+        entry.completeUnsafe(Exit.succeed(`name:${entry.request.id}`))
+      }
+    }))
+    const NameCache = RequestBatching.cache(resolver, { capacity: 16 })
+
+    const SessionRpcs = RpcGroup.make(
+      Rpc.make("ids", { success: Schema.Array(Schema.String) }),
+      Rpc.make("loadName", { payload: { id: Schema.String }, success: Schema.String })
+    ).middleware(RequestBatching.Middleware)
+    const Session = Capability.make("BatchedSession", SessionRpcs)
+    const Root = RpcGroup.make(Rpc.make("session", { success: Session.schema }))
+    const batching = await Effect.runPromise(Layer.build(RequestBatching.layer).pipe(Effect.scoped))
+    const handlers = await Effect.runPromise(Root.toHandlers({
+      session: () => Session.fromHandlers({
+        ids: () => Effect.succeed(["a", "b", "a"]),
+        loadName: ({ id }: { readonly id: string }) => Effect.flatMap(NameCache, Cache.get(new LoadName({ id })))
+      })
+    }).pipe(Effect.provideContext(batching)))
+    const context = Context.merge(handlers, batching)
+    const client = await Effect.runPromise(PipelineClient.make(Root, {
+      transport: (request) => PipelineServer.handle(Root, request).pipe(Effect.provideContext(context))
+    }))
+    const session = client.session()
+
+    expect(await Effect.runPromise(Pipeline.map(session.ids(), (id) => session.loadName({ id })))).toEqual([
+      "name:a",
+      "name:b",
+      "name:a"
+    ])
+    expect(batches).toEqual([["a", "b"]])
+  })
+
   it("pipelines through a returned typed capability", async () => {
     const SessionRpcs = RpcGroup.make(Rpc.make("whoami", { success: Schema.String }))
     const Session = Capability.make("Session", SessionRpcs)

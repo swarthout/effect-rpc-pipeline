@@ -183,6 +183,108 @@ Domain and middleware failures cross the boundary without a wrapper, so `Effect.
 
 Plain-object authentication is supported as well: project fields such as `rpc.authenticate(...).id` and pass them into other calls.
 
+## Backend request batching and caching
+
+`RequestBatching` keeps Effect's native `Request`, `RequestResolver`, and `Cache` APIs while giving every pipeline its own resolver identities and caches. Add its standard RPC middleware to RPCs whose handlers use request-scoped loaders:
+
+```ts
+import { Cache, Effect, Exit, Request, RequestResolver } from "effect"
+import * as RequestBatching from "effect-rpc-pipeline/RequestBatching"
+
+class GetUserById extends Request.TaggedClass("GetUserById")<
+  { readonly id: string },
+  User,
+  UserNotFound
+> {}
+
+const UserResolver = Effect.map(SqlClient.SqlClient, (sql) =>
+  RequestResolver.make<GetUserById>((entries) =>
+    Effect.gen(function*() {
+      const ids = Array.from(new Set(entries.map((entry) => entry.request.id)))
+      const rows = yield* sql<UserRow>`SELECT * FROM users WHERE ${sql.in("id", ids)}`
+      const byId = new Map(rows.map((row) => [row.id, row]))
+
+      for (const entry of entries) {
+        const row = byId.get(entry.request.id)
+        entry.completeUnsafe(row
+          ? Exit.succeed(User.fromRow(row))
+          : Exit.fail(new UserNotFound({ id: entry.request.id })))
+      }
+    })
+  )
+)
+
+const UserCache = RequestBatching.cache(UserResolver, {
+  capacity: 1_024,
+  timeToLive: (exit) => Exit.isSuccess(exit) ? "30 seconds" : 0
+})
+
+const AppRpcs = RpcGroup.make(ListUsers, GetUser).middleware(RequestBatching.Middleware)
+
+const AppHandlers = AppRpcs.of({
+  listUsers: () => Users.listIds,
+  getUser: ({ id }) => Effect.flatMap(UserCache, Cache.get(new GetUserById({ id })))
+})
+
+const ServerLive = PipelineServer.layerHttp({
+  group: AppRpcs,
+  path: "/rpc"
+}).pipe(
+  Layer.provide(AppRpcs.toLayer(AppHandlers)),
+  Layer.provide(RequestBatching.layer)
+)
+```
+
+Concurrent duplicate requests share one cache miss, and missing keys reach the resolver as one batch. The cache and cloned resolver are discarded after the pipeline, preventing different HTTP requests or SQL transactions from sharing resolver context.
+
+If one pipeline can operate under several authenticated identities or tenants, partition the cache explicitly:
+
+```ts
+const UserCache = RequestBatching.cache(UserResolver, {
+  capacity: 1_024,
+  partition: Effect.map(CurrentUser, (user) => user.tenantId)
+})
+```
+
+Alternatively, include the tenant in the `Request` value. Mutations must invalidate affected entries before a later query phase:
+
+```ts
+const updateUser = (id: string, patch: UserPatch) => Effect.gen(function*() {
+  const updated = yield* Users.update(id, patch)
+  const cache = yield* UserCache
+  yield* Cache.invalidate(cache, new GetUserById({ id }))
+  return updated
+})
+```
+
+Batching is not automatic for arbitrary effects: repository reads must use the same request-scoped cache or resolver, and the resolver must implement the downstream bulk operation.
+
+## Transactions
+
+`aroundExecution` wraps the raw server Effect before its typed failure is converted to a transport response. The included `sqlTransaction` wrapper runs every SQL operation in the pipeline—including client-selected post-mutation queries—on Effect SQL's transaction connection:
+
+```ts
+const ServerLive = PipelineServer.layerHttp({
+  group: AppRpcs,
+  path: "/rpc",
+  aroundExecution: PipelineServer.sqlTransaction
+}).pipe(
+  Layer.provide(AppLive),
+  Layer.provide(SqlLive)
+)
+```
+
+Typed failures, defects, and interruption reach `sql.withTransaction` before response encoding, so they roll back normally. Successful pipelines commit once. Nested `sql.withTransaction` calls retain Effect SQL's savepoint behavior.
+
+`aroundExecution` is generic and can implement tracing, metrics, application transactions, or a server-controlled transaction policy without adding an Effect SQL dependency to application handlers:
+
+```ts
+aroundExecution: (execution, { request, metadata }) =>
+  Effect.flatMap(SqlClient.SqlClient, (sql) => sql.withTransaction(execution))
+```
+
+Wrapping every pipeline in a transaction may be inappropriate for long-running external calls. Use a separate transactional endpoint or a server-side policy when only mutation pipelines should be transactional; transaction selection is deliberately not controlled by an untrusted client.
+
 ## Example and tests
 
 The complete TodoMVC client, standard Effect RPC handlers, Node HTTP server, and end-to-end workflow live in [`examples/todoapp`](./examples/todoapp). The test suite also keeps a small Cap'n Web fixture beside the equivalent pipeline behaviors.
