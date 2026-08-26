@@ -4,175 +4,123 @@ import * as Option from "effect/Option"
 import * as Schema from "effect/Schema"
 import * as Rpc from "effect/unstable/rpc/Rpc"
 import * as RpcGroup from "effect/unstable/rpc/RpcGroup"
+import * as RpcMiddleware from "effect/unstable/rpc/RpcMiddleware"
 import { describe, expect, it } from "vitest"
 import * as Capability from "../src/Capability.js"
 import * as Pipeline from "../src/Pipeline.js"
 import * as PipelineClient from "../src/PipelineClient.js"
 import * as PipelineServer from "../src/PipelineServer.js"
 
-const App = RpcGroup.make(
-  Rpc.make("people.greet", { payload: { name: Schema.String }, success: Schema.String }),
-  Rpc.make("people.ids", { success: Schema.Array(Schema.String) })
-)
-const Definition = Pipeline.make({ id: "test", root: App })
+const local = async <Rpcs extends Rpc.Any>(group: RpcGroup.RpcGroup<Rpcs>, handlers: any, id = "default") => {
+  const context = await Effect.runPromise(group.toHandlers(handlers) as Effect.Effect<any>)
+  let requests = 0
+  let last: Pipeline.PipelineRequest | undefined
+  const client = await Effect.runPromise(PipelineClient.make(group, { id, transport: (request) => {
+    requests++
+    last = request
+    return PipelineServer.handle(group, request, context, { id })
+  } }))
+  return { client, requests: () => requests, last: () => last }
+}
 
-const contextFor = async () => Effect.runPromise(App.toHandlers({
-  "people.greet": ({ name }) => Effect.succeed(`Hello ${name}`),
-  "people.ids": () => Effect.succeed(["a", "b", "c"])
-}))
-
-describe("pipeline recorder and interpreter", () => {
-  it("records dependent calls and evaluates a single transport request", async () => {
-    const context = await contextFor()
-    let requests = 0
-    const client = await Effect.runPromise(PipelineClient.make(Definition, {
-      transport: (request) => {
-        requests++
-        return PipelineServer.handle(Definition, request, context)
-      }
-    }))
-    const result = await Effect.runPromise(Pipeline.resolve(client, (rpc) => {
-      const ids = rpc.people.ids()
-      return ids.map((id) => ({ id, greeting: rpc.people.greet({ name: id }) }))
-    }))
-    expect(requests).toBe(1)
-    expect(result).toEqual([
-      { id: "a", greeting: "Hello a" },
-      { id: "b", greeting: "Hello b" },
-      { id: "c", greeting: "Hello c" }
-    ])
+describe("Effect-native pipeline client", () => {
+  it("keeps exact tags and makes every call a yieldable Effect", async () => {
+    const App = RpcGroup.make(Rpc.make("people.greet", { payload: { name: Schema.String }, success: Schema.String }))
+    const { client, requests } = await local(App, { "people.greet": ({ name }: { name: string }) => Effect.succeed(`Hello ${name}`) })
+    const result = await Effect.runPromise(Effect.gen(function*() { return yield* client["people.greet"]({ name: "Ada" }) }))
+    expect(result).toBe("Hello Ada")
+    expect(requests()).toBe(1)
+    expect((client as any).people).toBeUndefined()
   })
 
-  it("supports explicit ordering and rejects orphan calls", () => {
-    expect(() => Pipeline.requestFrom(Definition, (api) => {
-      api.people.greet({ name: "orphan" })
-      return api.people.ids()
-    })).toThrow(/Unreachable/)
+  it("batches independent calls", async () => {
+    const App = RpcGroup.make(Rpc.make("left", { success: Schema.String }), Rpc.make("right", { success: Schema.Number }))
+    const { client, requests } = await local(App, { left: () => Effect.succeed("L"), right: () => Effect.succeed(2) })
+    expect(await Effect.runPromise(Pipeline.all({ left: client.left(), right: client.right() }))).toEqual({ left: "L", right: 2 })
+    expect(requests()).toBe(1)
   })
 
-  it("uses generator yields for ordering and Pipeline.all for parallel siblings", async () => {
-    const Ordered = RpcGroup.make(
-      Rpc.make("todos.add", { payload: { title: Schema.String }, success: Schema.String }),
-      Rpc.make("todos.list", { success: Schema.Array(Schema.String) }),
-      Rpc.make("todos.count", { success: Schema.Number })
+  it("pipelines object fields through plain-object authentication", async () => {
+    const User = Schema.Struct({ id: Schema.String, name: Schema.String })
+    const App = RpcGroup.make(
+      Rpc.make("authenticate", { payload: { token: Schema.String }, success: User }),
+      Rpc.make("profile", { payload: { id: Schema.String }, success: Schema.String })
     )
-    const definition = Pipeline.make({ id: "ordered", root: Ordered })
-    const values: string[] = []
-    const context = await Effect.runPromise(Ordered.toHandlers({
-      "todos.add": ({ title }) => Effect.sync(() => { values.push(title); return title }),
-      "todos.list": () => Effect.sync(() => [...values]),
-      "todos.count": () => Effect.sync(() => values.length)
-    }))
-    let captured: Pipeline.PipelineRequest | undefined
-    const client = await Effect.runPromise(PipelineClient.make(definition, {
-      transport: (request) => {
-        captured = request
-        return PipelineServer.handle(definition, request, context)
-      }
-    }))
-
-    const result = await Effect.runPromise(Pipeline.run(client, function* (rpc) {
-      yield* rpc.todos.add({ title: "one" })
-      return yield* Pipeline.all({
-        todos: rpc.todos.list(),
-        count: rpc.todos.count()
-      })
-    }))
-
-    expect(result).toEqual({ todos: ["one"], count: 1 })
-    expect(captured?.nodes).toHaveLength(3)
-    expect(captured?.nodes[1]?.dependencies).toEqual(["$0"])
-    expect(captured?.nodes[2]?.dependencies).toEqual(["$0"])
-  })
-
-  it("executes yielded operations even when they are not part of the returned value", async () => {
-    const Commands = RpcGroup.make(Rpc.make("commands.record", {
-      payload: { value: Schema.String },
-      success: Schema.Void
-    }))
-    const definition = Pipeline.make({ id: "commands", root: Commands })
-    const recorded: string[] = []
-    const context = await Effect.runPromise(Commands.toHandlers({
-      "commands.record": ({ value }) => Effect.sync(() => { recorded.push(value) })
-    }))
-    const client = await Effect.runPromise(PipelineClient.make(definition, {
-      transport: (request) => PipelineServer.handle(definition, request, context)
-    }))
-
-    const result = await Effect.runPromise(Pipeline.run(client, function* (rpc) {
-      yield* rpc.commands.record({ value: "kept" })
-      return { ok: true }
-    }))
-
-    expect(result).toEqual({ ok: true })
-    expect(recorded).toEqual(["kept"])
-  })
-
-  it("runs independent ready nodes concurrently", async () => {
-    const Parallel = RpcGroup.make(
-      Rpc.make("work.left", { success: Schema.String }),
-      Rpc.make("work.right", { success: Schema.String })
-    )
-    const definition = Pipeline.make({ id: "parallel", root: Parallel })
-    let active = 0
-    let maximum = 0
-    const work = (value: string) => Effect.gen(function*() {
-      yield* Effect.sync(() => { active++; maximum = Math.max(maximum, active) })
-      yield* Effect.sleep("5 millis")
-      yield* Effect.sync(() => { active-- })
-      return value
+    const { client, requests } = await local(App, {
+      authenticate: () => Effect.succeed({ id: "u1", name: "Ada" }),
+      profile: ({ id }: { id: string }) => Effect.succeed(`profile:${id}`)
     })
-    const context = await Effect.runPromise(Parallel.toHandlers({
-      "work.left": () => work("left"),
-      "work.right": () => work("right")
-    }))
-    const client = await Effect.runPromise(PipelineClient.make(definition, {
-      transport: (request) => PipelineServer.handle(definition, request, context)
-    }))
-
-    const result = await Effect.runPromise(Pipeline.resolve(client, (rpc) => ({
-      left: rpc.work.left(),
-      right: rpc.work.right()
-    })))
-
-    expect(result).toEqual({ left: "left", right: "right" })
-    expect(maximum).toBe(2)
+    const user = client.authenticate({ token: "secret" })
+    expect(await Effect.runPromise(Pipeline.all({ user, profile: client.profile({ id: user.id }) }))).toEqual({ user: { id: "u1", name: "Ada" }, profile: "profile:u1" })
+    expect(requests()).toBe(1)
   })
 
-  it("rejects duplicate node identifiers before execution", async () => {
-    const context = await contextFor()
-    const request = Pipeline.requestFrom(Definition, (rpc) => rpc.people.ids())
-    const duplicated = { ...request, nodes: [...request.nodes, request.nodes[0]!] }
-    await expect(Effect.runPromise(PipelineServer.handle(Definition, duplicated, context))).rejects.toThrow(/Duplicate/)
+  it("maps arrays with per-element RPC calls in one request", async () => {
+    const App = RpcGroup.make(
+      Rpc.make("ids", { success: Schema.Array(Schema.String) }),
+      Rpc.make("greet", { payload: { name: Schema.String }, success: Schema.String })
+    )
+    const { client, requests } = await local(App, {
+      ids: () => Effect.succeed(["a", "b"]),
+      greet: ({ name }: { name: string }) => Effect.succeed(`Hello ${name}`)
+    })
+    const result = await Effect.runPromise(Pipeline.map(client.ids(), (id) => ({ id, greeting: client.greet({ name: id }) })))
+    expect(result).toEqual([{ id: "a", greeting: "Hello a" }, { id: "b", greeting: "Hello b" }])
+    expect(requests()).toBe(1)
   })
 
-  it("maps Effect Options", async () => {
-    const OptionApp = RpcGroup.make(Rpc.make("value", { success: Schema.Option(Schema.String) }))
-    const definition = Pipeline.make({ id: "option", root: OptionApp })
-    const context = await Effect.runPromise(OptionApp.toHandlers({ value: () => Effect.succeed(Option.some("x")) }))
-    const client = await Effect.runPromise(PipelineClient.make(definition, { transport: (request) => PipelineServer.handle(definition, request, context) }))
-    const result = await Effect.runPromise(Pipeline.resolve(client, (rpc) => rpc.value().map(() => rpc.value())))
-    expect(result).toEqual(Option.some(Option.some("x")))
+  it("maps Some and preserves None", async () => {
+    const App = RpcGroup.make(Rpc.make("maybe", { payload: { found: Schema.Boolean }, success: Schema.Option(Schema.String) }))
+    const { client } = await local(App, { maybe: ({ found }: { found: boolean }) => Effect.succeed(found ? Option.some("x") : Option.none()) })
+    expect(await Effect.runPromise(Pipeline.map(client.maybe({ found: true }), (value) => ({ value })))).toEqual(Option.some({ value: "x" }))
+    expect(await Effect.runPromise(Pipeline.map(client.maybe({ found: false }), (value) => ({ value })))).toEqual(Option.none())
+  })
+
+  it("orders a mutation before a combined query", async () => {
+    const App = RpcGroup.make(
+      Rpc.make("addTodo", { payload: { title: Schema.String }, success: Schema.Void }),
+      Rpc.make("listTodos", { success: Schema.Array(Schema.String) }),
+      Rpc.make("todoCount", { success: Schema.Number })
+    )
+    const values: string[] = []
+    const { client, requests } = await local(App, {
+      addTodo: ({ title }: { title: string }) => Effect.gen(function*() { values.push(title) }),
+      listTodos: () => Effect.gen(function*() { return [...values] }),
+      todoCount: () => Effect.gen(function*() { return values.length })
+    })
+    const query = Pipeline.all({ todos: client.listTodos(), count: client.todoCount() })
+    expect(await Effect.runPromise(Pipeline.zipRight(client.addTodo({ title: "one" }), query))).toEqual({ todos: ["one"], count: 1 })
+    expect(requests()).toBe(1)
+  })
+
+  it("rejects graphs combined across clients", async () => {
+    const App = RpcGroup.make(Rpc.make("value", { success: Schema.String }))
+    const a = await local(App, { value: () => Effect.succeed("a") })
+    const b = await local(App, { value: () => Effect.succeed("b") })
+    expect(() => Pipeline.all([a.client.value(), b.client.value()])).toThrow(/different pipeline clients/)
+  })
+
+  it("runs standard Effect RPC server middleware", async () => {
+    class Audit extends RpcMiddleware.Service<Audit>()("Audit") {}
+    const App = RpcGroup.make(Rpc.make("secureValue", { success: Schema.String })).middleware(Audit)
+    let audited = 0
+    const handlers = await Effect.runPromise(App.toHandlers({ secureValue: () => Effect.succeed("secret") }) as Effect.Effect<any>)
+    const context = Context.merge(handlers, Context.make(Audit, (effect) => Effect.andThen(Effect.sync(() => { audited++ }), effect) as any))
+    const client = await Effect.runPromise(PipelineClient.make(App, {
+      transport: (request) => PipelineServer.handle(App, request, context)
+    }))
+    expect(await Effect.runPromise(client.secureValue() as unknown as Effect.Effect<string>)).toBe("secret")
+    expect(audited).toBe(1)
   })
 })
 
-describe("capability descriptors", () => {
-  it("creates a batch-local capability value", () => {
-    const Group = RpcGroup.make(Rpc.make("ping", { success: Schema.String }))
-    const descriptor = Capability.make("Ping", Group)
-    const instance = descriptor.of({ ping: () => Effect.succeed("pong") })
-    expect(Capability.isInstance(instance)).toBe(true)
-    expect(instance.capabilityId).toBe("Ping")
-  })
-
-  it("pipelines calls through a returned capability", async () => {
-    const Group = RpcGroup.make(Rpc.make("ping", { success: Schema.String }))
-    const descriptor = Capability.make("Ping", Group)
-    const Root = RpcGroup.make(Rpc.make("cap", { success: descriptor.schema }))
-    const definition = Pipeline.make({ id: "capability", root: Root, capabilities: [descriptor] })
-    const context = await Effect.runPromise(Root.toHandlers({ cap: () => Effect.succeed(descriptor.of({ ping: () => Effect.succeed("pong") })) }))
-    const client = await Effect.runPromise(PipelineClient.make(definition, { transport: (request) => PipelineServer.handle(definition, request, context) }))
-    const result = await Effect.runPromise(Pipeline.resolve(client, (rpc) => rpc.cap().ping()))
-    expect(result).toBe("pong")
+describe("capability authentication", () => {
+  it("pipelines through a returned typed capability", async () => {
+    const SessionRpcs = RpcGroup.make(Rpc.make("whoami", { success: Schema.String }))
+    const Session = Capability.make("Session", SessionRpcs)
+    const Root = RpcGroup.make(Rpc.make("authenticate", { payload: { token: Schema.String }, success: Session.schema }))
+    const context = await Effect.runPromise(Root.toHandlers({ authenticate: () => Effect.succeed(Session.of({ whoami: () => Effect.succeed("Ada") })) }))
+    const client = await Effect.runPromise(PipelineClient.make(Root, { id: "auth", transport: (request) => PipelineServer.handle(Root, request, context, { id: "auth" }) }))
+    expect(await Effect.runPromise(client.authenticate({ token: "ok" }).whoami() as unknown as Effect.Effect<string>)).toBe("Ada")
   })
 })

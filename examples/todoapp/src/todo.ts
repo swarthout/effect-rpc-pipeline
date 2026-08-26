@@ -2,7 +2,6 @@ import * as Effect from "effect/Effect"
 import * as Schema from "effect/Schema"
 import * as Rpc from "effect/unstable/rpc/Rpc"
 import * as RpcGroup from "effect/unstable/rpc/RpcGroup"
-import * as Pipeline from "effect-rpc-pipeline/Pipeline"
 
 export const TodoFilter = Schema.Union([
   Schema.Literal("all"),
@@ -20,40 +19,38 @@ export class Todo extends Schema.Class<Todo>("Todo")({
 }) {}
 
 export const TodoRpcs = RpcGroup.make(
-  Rpc.make("todos.list", {
+  Rpc.make("listTodos", {
     payload: { filter: TodoFilter },
     success: Schema.Array(Todo)
   }),
-  Rpc.make("todos.add", {
+  Rpc.make("addTodo", {
     payload: { title: Schema.String },
     success: Todo
   }),
-  Rpc.make("todos.toggle", {
+  Rpc.make("toggleTodo", {
     payload: { id: Schema.String, completed: Schema.Boolean },
     success: Todo
   }),
-  Rpc.make("todos.toggleAll", {
+  Rpc.make("toggleAllTodos", {
     payload: { completed: Schema.Boolean },
     success: Schema.Array(Todo)
   }),
-  Rpc.make("todos.update", {
+  Rpc.make("updateTodo", {
     payload: { id: Schema.String, title: Schema.String },
     success: Todo
   }),
-  Rpc.make("todos.delete", {
+  Rpc.make("deleteTodo", {
     payload: { id: Schema.String },
     success: Schema.Boolean
   }),
-  Rpc.make("todos.clearCompleted", {
+  Rpc.make("clearCompletedTodos", {
     success: Schema.Number
   }),
-  Rpc.make("todos.count", {
+  Rpc.make("countTodos", {
     payload: { filter: TodoFilter },
     success: Schema.Number
   })
 )
-
-export const TodoPipeline = Pipeline.make({ id: "todo-mvc", root: TodoRpcs })
 
 export type TodoState = {
   readonly todos: ReadonlyArray<Todo>
@@ -133,32 +130,32 @@ const makeTodoRepository = (store: TodoStore) => ({
 
 export const makeTodoHandlers = (store: TodoStore) => {
   const repository = makeTodoRepository(store)
-  return {
-    "todos.list": ({ filter }: { filter: TodoFilter }) => Effect.gen(function*() {
+  return TodoRpcs.of({
+    listTodos: ({ filter }) => Effect.gen(function*() {
       return yield* repository.list(filter)
     }),
-    "todos.add": ({ title }: { title: string }) => Effect.gen(function*() {
+    addTodo: ({ title }) => Effect.gen(function*() {
       return yield* repository.add(title)
     }),
-    "todos.toggle": ({ id, completed }: { id: string; completed: boolean }) => Effect.gen(function*() {
+    toggleTodo: ({ id, completed }) => Effect.gen(function*() {
       return yield* repository.toggle(id, completed)
     }),
-    "todos.toggleAll": ({ completed }: { completed: boolean }) => Effect.gen(function*() {
+    toggleAllTodos: ({ completed }) => Effect.gen(function*() {
       return yield* repository.toggleAll(completed)
     }),
-    "todos.update": ({ id, title }: { id: string; title: string }) => Effect.gen(function*() {
+    updateTodo: ({ id, title }) => Effect.gen(function*() {
       return yield* repository.update(id, title)
     }),
-    "todos.delete": ({ id }: { id: string }) => Effect.gen(function*() {
+    deleteTodo: ({ id }) => Effect.gen(function*() {
       return yield* repository.remove(id)
     }),
-    "todos.clearCompleted": () => Effect.gen(function*() {
+    clearCompletedTodos: () => Effect.gen(function*() {
       return yield* repository.clearCompleted()
     }),
-    "todos.count": ({ filter }: { filter: TodoFilter }) => Effect.gen(function*() {
+    countTodos: ({ filter }) => Effect.gen(function*() {
       return (yield* repository.list(filter)).length
     })
-  }
+  })
 }
 
 export const makeTodoState = (todos: ReadonlyArray<Todo>, filter: TodoFilter, remaining: number): TodoState => ({ todos, filter, remaining })

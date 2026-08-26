@@ -1,8 +1,7 @@
 import * as Effect from "effect/Effect"
-import * as RpcServer from "effect/unstable/rpc/RpcServer"
 import * as Layer from "effect/Layer"
 import * as PipelineServer from "effect-rpc-pipeline/PipelineServer"
-import { AppPipeline, AppRpcs, AuthedCapability, User } from "./schema.js"
+import { AppRpcs, AuthedCapability, User } from "./schema.js"
 
 const users = new Map([
   ["usr_100", { id: "usr_100", name: "Ada", lastSeen: 0 }],
@@ -31,32 +30,32 @@ const UserRepository = {
   })
 }
 
-export const AppHandlers = {
-  "auth.authenticate": ({ token }: { token: string }) => Effect.gen(function*() {
+export const AppHandlers = AppRpcs.of({
+  authenticate: ({ token }) => Effect.gen(function*() {
     return AuthedCapability.of({
       getUserId: () => Effect.succeed(token === "demo-token" ? "usr_100" : "usr_101"),
       getFriendIds: () => Effect.succeed(["usr_101", "usr_102", "usr_103"])
     })
   }),
-  "users.getProfile": ({ id }: { id: string }) => Effect.gen(function*() {
+  getUserProfile: ({ id }) => Effect.gen(function*() {
     return yield* UserRepository.get(id)
   }),
-  "users.updateLastSeen": ({ id, timestamp }: { id: string; timestamp: number }) => Effect.gen(function*() {
+  updateLastSeen: ({ id, timestamp }) => Effect.gen(function*() {
     return yield* UserRepository.updateLastSeen(id, timestamp)
   })
-}
+})
 
 export const AppLive = AppRpcs.toLayer(AppHandlers)
 
 // Native Effect composition for a real RpcServer host. Existing AppLive is reused unchanged.
 export const ServerLive = PipelineServer.layerHttp({
   group: AppRpcs,
-  id: AppPipeline.id,
+  id: "example-app",
   path: "/rpc",
   protocol: "http"
 }).pipe(Layer.provide(AppLive))
 
 export const handlePipeline = async (request: unknown) => {
   const context = await Effect.runPromise(AppRpcs.toHandlers(AppHandlers))
-  return Effect.runPromise(PipelineServer.handle(AppPipeline, request as any, context) as any)
+  return Effect.runPromise(PipelineServer.handle(AppRpcs, request as any, context, { id: "example-app" }) as any)
 }

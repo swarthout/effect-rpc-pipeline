@@ -1,7 +1,7 @@
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http"
 import * as Effect from "effect/Effect"
 import * as PipelineServer from "effect-rpc-pipeline/PipelineServer"
-import { TodoPipeline, TodoRpcs, makeTodoHandlers, makeTodoStore, type TodoStore } from "./todo.js"
+import { TodoRpcs, makeTodoHandlers, makeTodoStore, type TodoStore } from "./todo.js"
 
 const readJson = (request: IncomingMessage): Promise<unknown> => new Promise((resolve, reject) => {
   let body = ""
@@ -16,7 +16,7 @@ const readJson = (request: IncomingMessage): Promise<unknown> => new Promise((re
 export const handleTodoPipeline = async (request: unknown, store: TodoStore) => {
   const handlers = makeTodoHandlers(store)
   const context = await Effect.runPromise(TodoRpcs.toHandlers(handlers))
-  return Effect.runPromise(PipelineServer.handle(TodoPipeline, request as any, context) as any)
+  return Effect.runPromise(PipelineServer.handle(TodoRpcs, request as any, context, { id: "todo-mvc" }) as any)
 }
 
 export const createTodoHttpServer = (store = makeTodoStore()): { readonly server: Server; readonly store: TodoStore; readonly requestCount: () => number } => {

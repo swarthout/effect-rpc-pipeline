@@ -1,69 +1,111 @@
 # effect-rpc-pipeline
 
-Effect-native promise pipelining for schema-backed RPC groups. Existing `RpcGroup` handler layers remain reusable; the package records dependent calls and sends the complete graph in one pipeline request.
+Effect-native RPC pipelining for existing `RpcGroup` definitions. Calls build immutable request graphs without performing I/O; each remote result is also an ordinary `Effect`, so it works directly with `Effect.gen`, `pipe`, and Effect error/environment inference.
 
-## Client API
+## Define the server normally
 
-Use dotted RPC tags to get the same nested proxy shape as Effect's native RPC client:
-
-```ts
-const TodoRpcs = RpcGroup.make(
-  Rpc.make("todos.list", { /* ... */ }),
-  Rpc.make("todos.add", { /* ... */ })
-)
-```
-
-`Pipeline.resolve` is the Cap'n Web-style API for graphs whose dependencies flow through unresolved values:
+No pipeline-specific naming convention or handler DSL is required. RPC tags are exact keys—dots are not parsed.
 
 ```ts
-const result = yield* Pipeline.resolve(client, (rpc) => {
-  const session = rpc.auth.authenticate({ token })
-  const friends = session.getFriendIds()
-
-  return friends.map((id) => ({
-    id,
-    profile: rpc.users.getProfile({ id })
-  }))
-})
-```
-
-`Pipeline.run` adds generator ordering for mutations or other calls without a data dependency. A yielded operation becomes the dependency frontier; calls in `Pipeline.all` are parallel siblings:
-
-```ts
-const state = yield* Pipeline.run(client, function* (rpc) {
-  yield* rpc.todos.add({ title })
-
-  return yield* Pipeline.all({
-    todos: rpc.todos.list({ filter }),
-    remaining: rpc.todos.count({ filter: "active" })
+const AppRpcs = RpcGroup.make(
+  Rpc.make("authenticate", {
+    payload: { token: Schema.String },
+    success: Schema.Struct({ id: Schema.String, name: Schema.String })
+  }),
+  Rpc.make("getProfile", {
+    payload: { id: Schema.String },
+    success: Profile
   })
-})
-```
+)
 
-The callback passed to `Pipeline.run` is a graph-building generator. Values yielded inside it are unresolved remote values and should be passed to subsequent RPC calls rather than used for local branching. The outer `Pipeline.run` is an ordinary `Effect`.
-
-## Adoption
-
-Keep the existing handler layer and add the pipeline server layer at the HTTP boundary:
-
-```ts
-const AppLive = AppRpcs.toLayer({
-  getUser: ({ id }) => UserRepository.get(id)
-})
+const AppLive = AppRpcs.toLayer(Effect.gen(function*() {
+  const users = yield* UserRepository
+  return AppRpcs.of({
+    authenticate: ({ token }) => users.authenticate(token),
+    getProfile: ({ id }) => users.getProfile(id)
+  })
+}))
 
 const ServerLive = PipelineServer.layerHttp({
   group: AppRpcs,
-  path: "/rpc",
-  id: "my-app"
+  path: "/rpc"
 }).pipe(Layer.provide(AppLive))
 ```
 
-The original `AppRpcs` group and ordinary Effect RPC clients remain valid. For custom protocols, use `PipelineServer.augment(definition)` and `PipelineServer.layer(definition)` with the normal `RpcServer` composition.
+The same group, handler layer, schemas, services, and RPC middleware remain usable by a standard Effect RPC server.
 
-`client.execute(builder)` remains temporarily available as a deprecated compatibility alias for `Pipeline.resolve(client, builder)`. `Pipeline.after` is also deprecated in favor of generator ordering.
+## Use calls as Effects or remote values
 
-The initial implementation targets Effect 4 RC and HTTP transports. Capabilities are batch-local. Streaming, persistent sessions, and wire compatibility with Cap'n Web are intentionally out of scope.
+```ts
+const rpc = yield* PipelineClient.make(AppRpcs, { url: "/rpc" })
 
-## Examples
+// A single call is a normal Effect.
+const profile = yield* rpc.getProfile({ id: "user-1" })
 
-The complete TodoMVC client, server, and HTTP end-to-end test live in [`examples/todoapp`](./examples/todoapp). Build this package first, then run the example's `npm install`, `npm run typecheck`, and `npm test` commands.
+// Unresolved fields can flow into later calls. This executes as one request.
+const user = rpc.authenticate({ token })
+const result = yield* Pipeline.all({
+  user,
+  profile: rpc.getProfile({ id: user.id })
+})
+```
+
+`Pipeline.all` replaces a special `$batch` call: the value being yielded is the batch boundary, while every dependency remains visible in the graph.
+
+Map arrays and Effect Options on the server without resolving them first:
+
+```ts
+const profiles = yield* Pipeline.map(rpc.friendIds(), (id) => ({
+  id,
+  profile: rpc.getProfile({ id })
+}))
+
+const greeting = yield* Pipeline.map(rpc.findUser({ email }), (user) =>
+  rpc.greet({ name: user.name })
+)
+```
+
+For mutations that have no data dependency, express ordering explicitly and keep the query parallel:
+
+```ts
+const state = yield* Pipeline.zipRight(
+  rpc.addTodo({ title }),
+  Pipeline.all({
+    todos: rpc.listTodos({ filter: "all" }),
+    remaining: rpc.countTodos({ filter: "active" })
+  })
+)
+```
+
+## Capability authentication
+
+For Cap'n Web-style authenticated sessions, return a typed batch-local capability:
+
+```ts
+const SessionRpcs = RpcGroup.make(
+  Rpc.make("whoami", { success: User }),
+  Rpc.make("friendIds", { success: Schema.Array(Schema.String) })
+)
+const Session = Capability.make("Session", SessionRpcs)
+
+const AppRpcs = RpcGroup.make(
+  Rpc.make("authenticate", {
+    payload: { token: Schema.String },
+    success: Session.schema
+  })
+)
+
+const session = rpc.authenticate({ token })
+const result = yield* Pipeline.all({
+  user: session.whoami(),
+  friends: Pipeline.map(session.friendIds(), (id) => rpc.getProfile({ id }))
+})
+```
+
+Plain-object authentication is supported as well: project fields such as `rpc.authenticate(...).id` and pass them into other calls.
+
+## Example and tests
+
+The complete TodoMVC client, standard Effect RPC handlers, Node HTTP server, and end-to-end workflow live in [`examples/todoapp`](./examples/todoapp). The test suite also keeps a small Cap'n Web fixture beside the equivalent pipeline behaviors.
+
+Streaming and persistent cross-request capabilities are not currently supported. Capabilities are scoped to one pipeline request.

@@ -8,8 +8,7 @@ import * as Schema from "effect/Schema"
 import * as Layer from "effect/Layer"
 import type { CapabilityInstance } from "./Capability.js"
 import { isInstance } from "./Capability.js"
-import type { Expr, PipelineDefinition, PipelineNode, PipelineRequest } from "./Pipeline.js"
-import { PipelineDefinitionTypeId } from "./Pipeline.js"
+import type { Expr, PipelineNode, PipelineRequest } from "./Pipeline.js"
 import type { PipelineResponse } from "./PipelineClient.js"
 
 export class PipelineError extends Error {
@@ -17,8 +16,45 @@ export class PipelineError extends Error {
   constructor(message: string, readonly code = "InvalidPipeline") { super(message) }
 }
 
+type ServerDefinition<R extends Rpc.Any> = { readonly id: string; readonly root: RpcGroup.RpcGroup<R> }
+
+const PathSchema = Schema.Array(Schema.Union([Schema.String, Schema.Number]))
+export const ExprSchema: Schema.Schema<Expr> = Schema.suspend(() => Schema.Union([
+  Schema.Struct({ _tag: Schema.Literal("literal"), value: Schema.optionalKey(Schema.Unknown) }),
+  Schema.Struct({ _tag: Schema.Literal("ref"), id: Schema.String, path: PathSchema }),
+  Schema.Struct({ _tag: Schema.Literal("item"), path: PathSchema }),
+  Schema.Struct({ _tag: Schema.Literal("array"), values: Schema.Array(ExprSchema) }),
+  Schema.Struct({ _tag: Schema.Literal("object"), entries: Schema.Array(Schema.Tuple([Schema.String, ExprSchema])) }),
+  Schema.Struct({ _tag: Schema.Literal("none") }),
+  Schema.Struct({ _tag: Schema.Literal("some"), value: ExprSchema })
+])) as Schema.Schema<Expr>
+export const PipelineNodeSchema: Schema.Schema<PipelineNode> = Schema.Union([
+  Schema.Struct({
+    _tag: Schema.Literal("call"),
+    id: Schema.String,
+    target: Schema.optionalKey(ExprSchema),
+    method: Schema.String,
+    payload: ExprSchema,
+    dependencies: Schema.Array(Schema.String)
+  }),
+  Schema.Struct({
+    _tag: Schema.Literal("map"),
+    id: Schema.String,
+    source: ExprSchema,
+    template: ExprSchema,
+    dependencies: Schema.Array(Schema.String)
+  })
+]) as Schema.Schema<PipelineNode>
+export const PipelineRequestSchema: Schema.Schema<PipelineRequest> = Schema.Struct({
+  version: Schema.Literal(1),
+  definitionId: Schema.String,
+  nodes: Schema.Array(PipelineNodeSchema),
+  selection: ExprSchema,
+  discards: Schema.Array(Schema.String)
+}) as Schema.Schema<PipelineRequest>
+
 export const PipelineRpc = Rpc.make("__effect_rpc_pipeline_v1", {
-  payload: Schema.Unknown,
+  payload: PipelineRequestSchema,
   success: Schema.Unknown,
   error: Schema.Unknown
 })
@@ -41,9 +77,11 @@ const evalExpr = (expr: Expr, values: Map<string, unknown>, item?: unknown): unk
       if (!values.has(expr.id)) throw new PipelineError(`Unknown or unresolved ref ${expr.id}`, "InvalidReference")
       return pathValue(values.get(expr.id), expr.path)
     }
-    case "item": return item
+    case "item": return pathValue(item, expr.path)
     case "array": return expr.values.map((value) => evalExpr(value, values, item))
     case "object": return Object.fromEntries(expr.entries.map(([key, value]) => [key, evalExpr(value, values, item)]))
+    case "none": return Option.none()
+    case "some": return Option.some(evalExpr(expr.value, values, item))
   }
 }
 
@@ -51,7 +89,7 @@ const dependencies = (node: PipelineNode): ReadonlyArray<string> => node.depende
 
 const containsItem = (expr: Expr): boolean => {
   switch (expr._tag) {
-    case "ref": return expr.id === "__item__"
+    case "item": return true
     case "array": return expr.values.some(containsItem)
     case "object": return expr.entries.some(([, value]) => containsItem(value))
     default: return false
@@ -59,13 +97,14 @@ const containsItem = (expr: Expr): boolean => {
 }
 
 const refsIn = (expr: Expr, out = new Set<string>()): Set<string> => {
-  if (expr._tag === "ref") { if (expr.id !== "__item__" && expr.id !== "__root__") out.add(expr.id); return out }
+  if (expr._tag === "ref") { out.add(expr.id); return out }
   if (expr._tag === "array") for (const value of expr.values) refsIn(value, out)
   if (expr._tag === "object") for (const [, value] of expr.entries) refsIn(value, out)
+  if (expr._tag === "some") refsIn(expr.value, out)
   return out
 }
 
-const executeNode = <R extends Rpc.Any>(definition: PipelineDefinition<R>, node: PipelineNode, values: Map<string, unknown>, context: Context.Context<any>, item?: unknown, nodeIndex = new Map<string, PipelineNode>()): Effect.Effect<void, unknown, any> => {
+const executeNode = <R extends Rpc.Any>(definition: ServerDefinition<R>, node: PipelineNode, values: Map<string, unknown>, context: Context.Context<any>, item?: unknown, nodeIndex = new Map<string, PipelineNode>()): Effect.Effect<void, unknown, any> => {
   const required = node._tag === "map" ? [...refsIn(node.source)] : dependencies(node)
   for (const dependency of required) if (!values.has(dependency)) return Effect.fail(new PipelineError(`Unresolved dependency ${dependency}`, "InvalidReference"))
   if (node._tag === "map") {
@@ -93,20 +132,33 @@ const executeNode = <R extends Rpc.Any>(definition: PipelineDefinition<R>, node:
       if (target !== undefined && !isInstance(target)) return Effect.fail(new PipelineError("Call target is not a capability", "InvalidTarget"))
       if (target !== undefined) {
         const instance = target as CapabilityInstance
-        const handler = instance.handlers[node.method]
+        const handler = (instance.handlers as Record<string, (...args: any[]) => any>)[node.method]
         if (!handler) return Effect.fail(new PipelineError(`Unknown capability method ${node.method}`, "UnknownMethod"))
         return Effect.suspend(() => handler(payload)).pipe(Effect.map((result) => { values.set(node.id, result); return undefined }))
       }
       return Effect.gen(function*() {
+        const rpc = definition.root.requests.get(node.method) as Rpc.AnyWithProps | undefined
+        if (!rpc) return yield* Effect.fail(new PipelineError(`Unknown RPC ${node.method}`, "UnknownMethod"))
+        const decodedPayload = yield* Schema.decodeUnknownEffect(rpc.payloadSchema)(payload)
         const access = yield* definition.root.accessHandler(node.method)
-        const result = yield* (access as any)(payload, { client: new Rpc.ServerClient(0), requestId: node.id, headers: {}, rpc: undefined } as any)
+        const metadata = { client: new Rpc.ServerClient(0), requestId: node.id, headers: {}, rpc, payload: decodedPayload } as any
+        const invoked = (access as any)(decodedPayload, metadata)
+        const base = Rpc.isWrapper(invoked) ? invoked.value : invoked
+        if (!Effect.isEffect(base)) return yield* Effect.fail(new PipelineError("Streaming RPCs are not supported in pipelines", "UnsupportedRpc"))
+        let program = base as Effect.Effect<unknown, unknown, any>
+        for (const service of rpc.middlewares) {
+          const middleware = Context.getUnsafe(context, service) as any
+          program = middleware(program, metadata)
+        }
+        const result = yield* program
         values.set(node.id, result)
       }).pipe(Effect.provideContext(context))
     })
   )
 }
 
-export const handle = <R extends Rpc.Any>(definition: PipelineDefinition<R>, request: PipelineRequest, context: Context.Context<any> = Context.empty() as any): Effect.Effect<PipelineResponse, unknown, never> => {
+export const handle = <R extends Rpc.Any>(group: RpcGroup.RpcGroup<R>, request: PipelineRequest, context: Context.Context<any> = Context.empty() as any, options?: { readonly id?: string }): Effect.Effect<PipelineResponse, unknown, never> => {
+  const definition: ServerDefinition<R> = { id: options?.id ?? "default", root: group }
   if (request.version !== 1 || request.definitionId !== definition.id) return Effect.fail(new PipelineError("Unsupported pipeline definition or version"))
   if (request.nodes.length > 1000) return Effect.fail(new PipelineError("Pipeline node limit exceeded", "LimitExceeded"))
   const values = new Map<string, unknown>()
@@ -132,12 +184,12 @@ export const handle = <R extends Rpc.Any>(definition: PipelineDefinition<R>, req
   ) as Effect.Effect<PipelineResponse, unknown, never>
 }
 
-export const augment = <R extends Rpc.Any>(definition: PipelineDefinition<R>): RpcGroup.RpcGroup<R | typeof PipelineRpc> => definition.root.add(PipelineRpc)
+export const augment = <R extends Rpc.Any>(group: RpcGroup.RpcGroup<R>): RpcGroup.RpcGroup<R | typeof PipelineRpc> => group.add(PipelineRpc)
 
-export const layer = <R extends Rpc.Any>(definition: PipelineDefinition<R>): Layer.Layer<Rpc.ToHandler<typeof PipelineRpc>, never, Rpc.ToHandler<R>> =>
+export const layer = <R extends Rpc.Any>(group: RpcGroup.RpcGroup<R>, options?: { readonly id?: string }): Layer.Layer<Rpc.ToHandler<typeof PipelineRpc>, never, Rpc.ToHandler<R>> =>
   Layer.effectContext(Effect.gen(function*() {
     const context = yield* Effect.context<any>()
-    const handler = (request: PipelineRequest) => handle(definition, request, context)
+    const handler = (request: PipelineRequest) => handle(group, request, context, options)
     return Context.makeUnsafe(new Map([[PipelineRpc.key, { tag: PipelineRpc._tag, handler, context }]]))
   }))
 
@@ -147,15 +199,9 @@ export const layerHttp = <R extends Rpc.Any>(options: {
   readonly id?: string
   readonly protocol?: "http" | "websocket"
 }) => {
-  const definition = {
-    [PipelineDefinitionTypeId]: true,
-    id: options.id ?? "default",
-    root: options.group,
-    capabilities: []
-  } as PipelineDefinition<R>
   return RpcServer.layerHttp({
-    group: augment(definition),
+    group: augment(options.group),
     path: options.path as any,
     protocol: options.protocol ?? "http"
-  }).pipe(Layer.provide(layer(definition)))
+  }).pipe(Layer.provide(layer(options.group, options.id === undefined ? undefined : { id: options.id })))
 }

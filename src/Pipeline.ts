@@ -1,362 +1,187 @@
 import * as Effect from "effect/Effect"
+import * as Effectable from "effect/Effectable"
 import * as Option from "effect/Option"
 import type * as Rpc from "effect/unstable/rpc/Rpc"
 import type * as RpcGroup from "effect/unstable/rpc/RpcGroup"
+import { CapabilityGroupTypeId } from "./Capability.js"
 
 export const PipelineRefTypeId = Symbol.for("effect-rpc-pipeline/PipelineRef")
-export const PipelineDefinitionTypeId = Symbol.for("effect-rpc-pipeline/PipelineDefinition")
-export const PipelineClientTypeId = Symbol.for("effect-rpc-pipeline/PipelineClient")
-const PipelineSelectionTypeId = Symbol.for("effect-rpc-pipeline/PipelineSelection")
+const OperationTypeId = Symbol.for("effect-rpc-pipeline/Operation")
 
-export type CapabilityDescriptor = {
-  readonly _tag: "CapabilityDescriptor"
-  readonly id: string
-  readonly group: RpcGroup.RpcGroup<any>
+export class PipelineClientError extends Error {
+  readonly _tag = "PipelineClientError"
+  constructor(message: string, readonly cause?: unknown) { super(message) }
 }
 
 export type Expr =
-  | { readonly _tag: "literal"; readonly value: unknown }
+  | { readonly _tag: "literal"; readonly value?: unknown }
   | { readonly _tag: "ref"; readonly id: string; readonly path: ReadonlyArray<string | number> }
-  | { readonly _tag: "item" }
+  | { readonly _tag: "item"; readonly path: ReadonlyArray<string | number> }
   | { readonly _tag: "array"; readonly values: ReadonlyArray<Expr> }
   | { readonly _tag: "object"; readonly entries: ReadonlyArray<readonly [string, Expr]> }
+  | { readonly _tag: "none" }
+  | { readonly _tag: "some"; readonly value: Expr }
 
-export type CallNode = {
-  readonly _tag: "call"
-  readonly id: string
-  readonly target: Expr | undefined
-  readonly method: string
-  readonly payload: Expr
-  readonly dependencies: ReadonlyArray<string>
-}
-
-export type MapNode = {
-  readonly _tag: "map"
-  readonly id: string
-  readonly source: Expr
-  readonly template: Expr
-  readonly dependencies: ReadonlyArray<string>
-}
-
+export type CallNode = { readonly _tag: "call"; readonly id: string; readonly target?: Expr; readonly method: string; readonly payload: Expr; readonly dependencies: ReadonlyArray<string> }
+export type MapNode = { readonly _tag: "map"; readonly id: string; readonly source: Expr; readonly template: Expr; readonly dependencies: ReadonlyArray<string> }
 export type PipelineNode = CallNode | MapNode
+export type PipelineRequest = { readonly version: 1; readonly definitionId: string; readonly nodes: ReadonlyArray<PipelineNode>; readonly selection: Expr; readonly discards: ReadonlyArray<string> }
+export type PipelineTransport = (request: PipelineRequest) => Effect.Effect<{ readonly value: unknown }, unknown, never>
 
-export type PipelineRequest = {
-  readonly version: 1
-  readonly definitionId: string
-  readonly nodes: ReadonlyArray<PipelineNode>
-  readonly selection: Expr
-  readonly discards: ReadonlyArray<string>
-}
+type Runtime = { readonly definitionId: string; readonly execute: (request: PipelineRequest) => Effect.Effect<unknown, PipelineClientError, never>; nextId(): string }
+type Graph = { readonly runtime: Runtime; readonly nodes: ReadonlyArray<PipelineNode>; readonly selection: Expr; readonly discards: ReadonlyArray<string> }
+type InternalOperation = Effect.Effect<any, any, any> & { readonly [OperationTypeId]: true; readonly [PipelineRefTypeId]: true; readonly graph: Graph }
+type CapabilityClient<A, E, R> = A extends { readonly [CapabilityGroupTypeId]: infer Group extends RpcGroup.RpcGroup<any> } ? ClientApi<RpcGroup.Rpcs<Group>, E, R> : unknown
+type RemoteFields<A, E, R> = A extends Option.Option<any> | ReadonlyArray<any> ? unknown : A extends object ? { readonly [K in keyof A as A[K] extends (...args: any[]) => any ? never : K]: Remote<A[K], E, R> } : unknown
 
-export type PipelineDefinition<Rpcs extends Rpc.Any = any> = {
-  readonly [PipelineDefinitionTypeId]: true
-  readonly id: string
-  readonly root: RpcGroup.RpcGroup<Rpcs>
-  readonly capabilities: ReadonlyArray<CapabilityDescriptor>
-}
+/** A remote value that composes without I/O and is also a normal Effect when yielded. */
+export type Remote<A, E = unknown, R = never> = Effect.Effect<A, E, R> & { readonly [PipelineRefTypeId]: true; readonly readonlyType?: A } & CapabilityClient<A, E, R> & RemoteFields<A, E, R>
+export type PipelineOperation<A, E = unknown, R = never> = Remote<A, E, R>
+type PipelineMethod<R extends Rpc.Any, E, Env> = (input: PipelineInput<Rpc.PayloadConstructor<R>>) => Remote<Rpc.Success<R>, Rpc.Error<R> | E | PipelineClientError, Rpc.ServicesClient<R> | Env>
 
-export type PipelineRef<T = unknown> = {
-  readonly [PipelineRefTypeId]: true
-  readonly readonlyType?: T
-}
-
-type UnionToIntersection<U> = (U extends unknown ? (value: U) => void : never) extends
-  ((value: infer I) => void) ? I : never
-
-type ClientEntry<R extends Rpc.Any> = R["_tag"] extends `${infer Head}.${infer Tail}`
-  ? { readonly [K in Head]: ClientPath<R, Tail> }
-  : { readonly [K in R["_tag"]]: PipelineMethod<R> }
-
-type ClientPath<R extends Rpc.Any, Path extends string> = Path extends `${infer Head}.${infer Tail}`
-  ? { readonly [K in Head]: ClientPath<R, Tail> }
-  : { readonly [K in Path]: PipelineMethod<R> }
-
-type PipelineMethod<R extends Rpc.Any> = (
-  input: PipelineInput<Rpc.PayloadConstructor<R>>
-) => PipelineOperation<Rpc.Success<R>>
-
-/** A typed, nested proxy surface derived from the tags in an Effect RpcGroup. */
-export type ClientApi<Rpcs extends Rpc.Any> = UnionToIntersection<Rpcs extends unknown ? ClientEntry<Rpcs> : never>
-
-/** Allows unresolved pipeline values anywhere a concrete RPC payload value is accepted. */
-export type PipelineInput<A> = A | PipelineOperation<A> |
-  (A extends ReadonlyArray<infer I> ? ReadonlyArray<PipelineInput<I>> :
-    A extends object ? { readonly [K in keyof A]: PipelineInput<A[K]> } : never)
-
-type CapabilityClient<A> = A extends { readonly group: RpcGroup.RpcGroup<infer Rpcs> }
-  ? ClientApi<Rpcs>
-  : unknown
-
-type PipelineMap<A> = A extends ReadonlyArray<infer Item>
-  ? { readonly map: <B>(mapper: (item: PipelineValue<Item>) => B) => PipelineOperation<ReadonlyArray<Resolved<B>>> }
-  : A extends Option.Option<infer Item>
-  ? { readonly map: <B>(mapper: (item: PipelineValue<Item>) => B) => PipelineOperation<Option.Option<Resolved<B>>> }
-  : unknown
-
-/** The value shape visible while a graph is being recorded. */
-export type PipelineValue<A> = A extends { readonly group: RpcGroup.RpcGroup<any> }
-  ? CapabilityClient<A>
-  : A
-
-/** A lazy remote operation. It is callable through capability proxies and yieldable in Pipeline.run. */
-export type PipelineOperation<A> = PipelineRef<A> & CapabilityClient<A> & PipelineMap<A> & {
-  readonly [Symbol.iterator]: () => Generator<PipelineOperation<A>, PipelineValue<A>, unknown>
-}
-
-/** Resolves operations embedded in an output structure to their actual server values. */
-export type Resolved<A> = A extends PipelineRef<infer T> ? T
+/** Exact RPC tags become client keys. Dots have no special meaning. */
+export type ClientApi<Rpcs extends Rpc.Any, E = never, Env = never> = { readonly [R in Rpcs as R["_tag"]]: PipelineMethod<R, E, Env> }
+export type PipelineInput<A> = A | Remote<A, any, any> | (A extends ReadonlyArray<infer I> ? ReadonlyArray<PipelineInput<I>> : A extends Option.Option<infer I> ? Option.Option<PipelineInput<I>> : A extends object ? { readonly [K in keyof A]: PipelineInput<A[K]> } : never)
+export type Resolved<A> = A extends Effect.Effect<infer Success, any, any> ? Success
+  : A extends Option.Option<infer I> ? Option.Option<Resolved<I>>
   : A extends ReadonlyArray<infer I> ? ReadonlyArray<Resolved<I>>
   : A extends object ? { readonly [K in keyof A]: Resolved<A[K]> }
   : A
+type ErrorsIn<A> = A extends Effect.Effect<any, infer E, any> ? E
+  : A extends Option.Option<infer I> ? ErrorsIn<I>
+  : A extends ReadonlyArray<infer I> ? ErrorsIn<I>
+  : A extends object ? { readonly [K in keyof A]: ErrorsIn<A[K]> }[keyof A]
+  : never
+type ServicesIn<A> = A extends Effect.Effect<any, any, infer R> ? R
+  : A extends Option.Option<infer I> ? ServicesIn<I>
+  : A extends ReadonlyArray<infer I> ? ServicesIn<I>
+  : A extends object ? { readonly [K in keyof A]: ServicesIn<A[K]> }[keyof A]
+  : never
 
-export type RunnableClient<D extends PipelineDefinition = PipelineDefinition> = {
-  readonly definition: D
-  readonly [PipelineClientTypeId]: {
-    readonly execute: (request: PipelineRequest) => Effect.Effect<unknown, unknown, never>
-  }
-}
-
-type Selection<A> = {
-  readonly [PipelineSelectionTypeId]: true
-  readonly value: A
-  readonly [Symbol.iterator]: () => Generator<Selection<A>, A, unknown>
-}
-
-type InternalRef = PipelineRef & {
-  readonly __expr: Expr
-  readonly __context: Recorder
-}
-
-type Recorder = {
-  readonly nodes: PipelineNode[]
-  readonly contextId: symbol
-  nextId(): string
-  explicitDeps: Set<string> | undefined
-  discards: Set<string>
-}
-
-const isRef = (u: unknown): u is InternalRef =>
-  (typeof u === "object" || typeof u === "function") && u !== null && (u as any)[PipelineRefTypeId] === true
-
-const collectRefs = (expr: Expr, out = new Set<string>()): Set<string> => {
+const isOperation = (u: unknown): u is InternalOperation => (typeof u === "object" || typeof u === "function") && u !== null && (u as any)[OperationTypeId] === true
+const refsIn = (expr: Expr, out = new Set<string>()): Set<string> => {
   switch (expr._tag) {
-    case "ref": if (expr.id !== "__item__" && expr.id !== "__root__") out.add(expr.id); break
-    case "array": for (const item of expr.values) collectRefs(item, out); break
-    case "object": for (const [, item] of expr.entries) collectRefs(item, out); break
+    case "ref": out.add(expr.id); break
+    case "array": for (const value of expr.values) refsIn(value, out); break
+    case "object": for (const [, value] of expr.entries) refsIn(value, out); break
+    case "some": refsIn(expr.value, out); break
   }
   return out
 }
-
-const toExpr = (value: unknown, ctx: Recorder): Expr => {
-  if (isRef(value)) {
-    if (value.__context !== ctx) throw new Error("Pipeline refs cannot be used across execute calls")
-    return value.__expr
-  }
-  if (Array.isArray(value)) return { _tag: "array", values: value.map((v) => toExpr(v, ctx)) }
-  if (value && typeof value === "object") {
-    return {
-      _tag: "object",
-      entries: Object.keys(value as object).map((key) => [key, toExpr((value as any)[key], ctx)] as const)
-    }
-  }
+const mergeNodes = (...graphs: ReadonlyArray<Graph>): ReadonlyArray<PipelineNode> => {
+  const nodes = new Map<string, PipelineNode>()
+  for (const graph of graphs) for (const node of graph.nodes) nodes.set(node.id, node)
+  return [...nodes.values()]
+}
+const assertRuntime = (runtime: Runtime, graph: Graph) => { if (runtime !== graph.runtime) throw new Error("Remote values from different pipeline clients cannot be combined") }
+const encodeValue = (value: unknown, runtime: Runtime, graphs: Graph[]): Expr => {
+  if (isOperation(value)) { assertRuntime(runtime, value.graph); graphs.push(value.graph); return value.graph.selection }
+  if (Option.isOption(value)) return Option.isNone(value) ? { _tag: "none" } : { _tag: "some", value: encodeValue(value.value, runtime, graphs) }
+  if (Array.isArray(value)) return { _tag: "array", values: value.map((item) => encodeValue(item, runtime, graphs)) }
+  if (value !== null && typeof value === "object") return { _tag: "object", entries: Object.keys(value).map((key) => [key, encodeValue((value as any)[key], runtime, graphs)] as const) }
   return { _tag: "literal", value }
 }
+const requestFor = (graph: Graph): PipelineRequest => ({ version: 1, definitionId: graph.runtime.definitionId, nodes: graph.nodes, selection: graph.selection, discards: graph.discards })
 
-const makeRef = (ctx: Recorder, expr: Expr): InternalRef => {
-  const callable = (() => undefined) as any
-  let proxy: InternalRef
-  proxy = new Proxy(callable, {
-    get(_target, property: string | symbol) {
-      if (property === PipelineRefTypeId) return true
-      if (property === "__expr") return expr
-      if (property === "__context") return ctx
+const OperationProto = Effectable.Prototype({
+  label: "PipelineOperation",
+  evaluate() {
+    const operation = this as unknown as InternalOperation
+    return operation.graph.runtime.execute(requestFor(operation.graph))
+  }
+})
+const project = (expr: Expr, property: string): Expr => {
+  if (expr._tag === "ref" || expr._tag === "item") return { ...expr, path: [...expr.path, property] }
+  throw new Error("Only a remote reference can be projected")
+}
+const makeRemote = <A, E = unknown, R = never>(graph: Graph): Remote<A, E, R> => {
+  const operation = Object.assign(() => undefined, {
+    [OperationTypeId]: true as const,
+    [PipelineRefTypeId]: true as const,
+    graph
+  })
+  Object.setPrototypeOf(operation, OperationProto)
+  return new Proxy(operation as any, {
+    get(target, property, receiver) {
+      if (property === OperationTypeId || property === PipelineRefTypeId || property === "graph") return Reflect.get(target, property, receiver)
       if (property === "then") return undefined
-      if (property === Symbol.iterator) {
-        return () => {
-          let yielded = false
-          return {
-            next: () => yielded
-              ? { done: true as const, value: proxy }
-              : (yielded = true, { done: false as const, value: proxy }),
-            [Symbol.iterator]() { return this }
-          }
-        }
+      if (typeof property === "symbol" || property in target) {
+        const value = Reflect.get(target, property, receiver)
+        return typeof value === "function" ? value.bind(target) : value
       }
-      if (property === "map") {
-        return (mapper: (item: unknown) => unknown) => {
-          const previous = ctx.explicitDeps
-          ctx.explicitDeps = new Set(collectRefs(expr))
-          try {
-            const mapped = mapper(makeRef(ctx, { _tag: "ref", id: "__item__", path: [] }))
-            const template = toExpr(mapped, ctx)
-            const id = ctx.nextId()
-            const dependencies = new Set<string>([...collectRefs(expr), ...collectRefs(template)])
-            ctx.nodes.push({ _tag: "map", id, source: expr, template, dependencies: [...dependencies] })
-            return makeRef(ctx, { _tag: "ref", id, path: [] })
-          } finally {
-            ctx.explicitDeps = previous
-          }
-        }
-      }
-      if (property === "toJSON" || property === Symbol.toPrimitive) {
-        throw new Error("Pipeline refs cannot be coerced or iterated while recording")
-      }
-      if (typeof property === "symbol") return undefined
-      return makeRef(ctx, { _tag: "ref", id: expr._tag === "ref" ? expr.id : "__root__", path: expr._tag === "ref" ? [...expr.path, property] : [property] })
+      return makeRemote({ ...graph, selection: project(graph.selection, property) })
     },
     apply(_target, _thisArg, args: ReadonlyArray<unknown>) {
-      if (expr._tag !== "ref") throw new Error("Only RPC method refs can be called")
-      const last = expr.path.at(-1)
-      if (typeof last !== "string") throw new Error("Invalid RPC method")
-      const isRoot = expr.id === "__root__"
-      const method = isRoot ? expr.path.join(".") : last
-      const target = isRoot ? undefined : { _tag: "ref", id: expr.id, path: expr.path.slice(0, -1) } as Expr
-      const payload: Expr = args.length === 0
-        ? { _tag: "literal", value: undefined }
-        : args.length === 1
-        ? toExpr(args[0], ctx)
-        : { _tag: "array", values: args.map((a) => toExpr(a, ctx)) }
-      const id = ctx.nextId()
-      const deps = new Set<string>([...collectRefs(payload), ...(target ? collectRefs(target) : []), ...(ctx.explicitDeps ?? [])])
-      ctx.nodes.push({ _tag: "call", id, target, method, payload, dependencies: [...deps] })
-      return makeRef(ctx, { _tag: "ref", id, path: [] })
+      const selected = graph.selection
+      if (selected._tag !== "ref" || selected.path.length === 0) throw new Error("Only a remote capability method can be called")
+      const method = selected.path[selected.path.length - 1]
+      if (typeof method !== "string") throw new Error("Invalid capability method")
+      const target: Expr = { ...selected, path: selected.path.slice(0, -1) }
+      const extra: Graph[] = []
+      const payload = encodeValue(args.length === 0 ? undefined : args.length === 1 ? args[0] : args, graph.runtime, extra)
+      const id = graph.runtime.nextId()
+      const node: CallNode = { _tag: "call", id, target, method, payload, dependencies: [...new Set([...refsIn(target), ...refsIn(payload)])] }
+      return makeRemote({ runtime: graph.runtime, nodes: [...mergeNodes(graph, ...extra), node], selection: { _tag: "ref", id, path: [] }, discards: [] })
     }
-  }) as InternalRef
-  return proxy
+  })
 }
 
-export const makeRecorder = <Rpcs extends Rpc.Any = Rpc.Any>(): { readonly context: Recorder; readonly root: ClientApi<Rpcs> } => {
-  const ctx: Recorder = {
-    nodes: [],
-    contextId: Symbol("pipeline-context"),
-    explicitDeps: undefined,
-    discards: new Set(),
-    nextId: () => `$${ctx.nodes.length}`
-  }
-  const root = makeRef(ctx, { _tag: "ref", id: "__root__", path: [] })
-  return { context: ctx, root: root as unknown as ClientApi<Rpcs> }
-}
-
-export const make = <Rpcs extends Rpc.Any>(options: {
-  readonly id?: string
-  readonly root: RpcGroup.RpcGroup<Rpcs>
-  readonly capabilities?: ReadonlyArray<CapabilityDescriptor>
-}): PipelineDefinition<Rpcs> => ({
-  [PipelineDefinitionTypeId]: true,
-  id: options.id ?? "default",
-  root: options.root,
-  capabilities: options.capabilities ?? []
-})
-
-/** @deprecated Prefer generator sequencing with Pipeline.run. */
-export const after = <A, B>(dependency: PipelineRef<A>, thunk: () => B): B => {
-  if (!isRef(dependency)) throw new Error("Pipeline.after requires a ref from the current pipeline evaluation")
-  const ctx = dependency.__context
-  const previous = ctx.explicitDeps
-  ctx.explicitDeps = new Set(collectRefs(dependency.__expr))
-  try { return thunk() } finally { ctx.explicitDeps = previous }
-}
-
-export const discard = (ref: PipelineRef): void => {
-  if (!isRef(ref) || ref.__expr._tag !== "ref") throw new Error("Pipeline.discard requires a call ref")
-  ref.__context.discards.add(ref.__expr.id)
-}
-
-export const requestFrom = <R extends Rpc.Any, A>(definition: PipelineDefinition<R>, builder: (api: ClientApi<R>) => A): PipelineRequest => {
-  const { context, root } = makeRecorder<R>()
-  const selection = toExpr(builder(root), context)
-  for (const node of context.nodes) {
-    if (node._tag === "call" && node.target?._tag === "ref" && node.target.id === "__root__") {
-      // Root method refs are represented by their method path on the call expression.
-    }
-  }
-  const reachable = new Set(collectRefs(selection))
-  for (const id of context.discards) reachable.add(id)
-  let changed = true
-  while (changed) {
-    changed = false
-    for (const node of context.nodes) {
-      if (reachable.has(node.id)) for (const dep of node.dependencies) {
-        if (!reachable.has(dep)) { reachable.add(dep); changed = true }
+export const makeClient = <Rpcs extends Rpc.Any>(group: RpcGroup.RpcGroup<Rpcs>, definitionId: string, execute: Runtime["execute"]): ClientApi<Rpcs> => {
+  let sequence = 0
+  const runtime: Runtime = { definitionId, execute, nextId: () => `$${sequence++}` }
+  return new Proxy({}, {
+    get(_target, property) {
+      if (typeof property !== "string" || !group.requests.has(property)) return undefined
+      return (input?: unknown) => {
+        const extra: Graph[] = []
+        const payload = encodeValue(input, runtime, extra)
+        const id = runtime.nextId()
+        const node: CallNode = { _tag: "call", id, method: property, payload, dependencies: [...refsIn(payload)] }
+        return makeRemote({ runtime, nodes: [...mergeNodes(...extra), node], selection: { _tag: "ref", id, path: [] }, discards: [] })
       }
     }
-  }
-  const orphan = context.nodes.filter((n) => !reachable.has(n.id) && n._tag === "call")
-  if (orphan.length > 0) throw new Error(`Unreachable pipeline calls: ${orphan.map((n) => n.id).join(", ")}`)
-  return { version: 1, definitionId: definition.id, nodes: context.nodes, selection, discards: [...context.discards] }
+  }) as ClientApi<Rpcs>
 }
 
-const isSelection = (value: unknown): value is Selection<unknown> =>
-  typeof value === "object" && value !== null && (value as any)[PipelineSelectionTypeId] === true
-
-const yieldedValue = (value: unknown): unknown => isSelection(value) ? value.value : value
-
-/** Marks a group of operations as parallel siblings when it is yielded inside Pipeline.run. */
-export const all = <A>(value: A): Selection<A> => {
-  const selection: Selection<A> = {
-    [PipelineSelectionTypeId]: true,
-    value,
-    [Symbol.iterator]: function*() {
-      yield selection
-      return value
-    }
+/** Combines structured remote values into one request. */
+export const all = <A>(value: A): Remote<Resolved<A>, ErrorsIn<A>, ServicesIn<A>> => {
+  const operations: InternalOperation[] = []
+  const find = (current: unknown): void => {
+    if (isOperation(current)) { operations.push(current); return }
+    if (Option.isOption(current)) { if (Option.isSome(current)) find(current.value); return }
+    if (Array.isArray(current)) { for (const item of current) find(item); return }
+    if (current && typeof current === "object") for (const item of Object.values(current)) find(item)
   }
-  return selection
+  find(value)
+  if (operations.length === 0) throw new Error("Pipeline.all requires at least one remote operation")
+  const runtime = operations[0]!.graph.runtime
+  const graphs: Graph[] = []
+  const selection = encodeValue(value, runtime, graphs)
+  return makeRemote({ runtime, nodes: mergeNodes(...graphs), selection, discards: [] }) as Remote<Resolved<A>, ErrorsIn<A>, ServicesIn<A>>
 }
 
-const requestFromGenerator = <R extends Rpc.Any, A>(
-  definition: PipelineDefinition<R>,
-  program: (api: ClientApi<R>) => Generator<PipelineRef | Selection<unknown>, A, unknown>
-): PipelineRequest => {
-  const { context, root } = makeRecorder<R>()
-  const iterator = program(root)
-  let step = iterator.next()
-  while (!step.done) {
-    const value = yieldedValue(step.value)
-    const expr = toExpr(value, context)
-    const yieldedRefs = collectRefs(expr)
-    for (const id of yieldedRefs) context.discards.add(id)
-    context.explicitDeps = yieldedRefs
-    step = iterator.next(value)
-  }
-  const selection = toExpr(step.value, context)
-  const reachable = new Set(collectRefs(selection))
-  for (const id of context.discards) reachable.add(id)
-  let changed = true
-  while (changed) {
-    changed = false
-    for (const node of context.nodes) if (reachable.has(node.id)) for (const dep of node.dependencies) {
-      if (!reachable.has(dep)) { reachable.add(dep); changed = true }
-    }
-  }
-  const orphan = context.nodes.filter((node) => node._tag === "call" && !reachable.has(node.id))
-  if (orphan.length > 0) throw new Error(`Unreachable pipeline calls: ${orphan.map((node) => node.id).join(", ")}`)
-  return { version: 1, definitionId: definition.id, nodes: context.nodes, selection, discards: [...context.discards] }
+export function map<A, B, E, R>(source: Remote<ReadonlyArray<A>, E, R>, mapper: (item: Remote<A, E, R>) => B): Remote<ReadonlyArray<Resolved<B>>, E | PipelineClientError, R>
+export function map<A, B, E, R>(source: Remote<Option.Option<A>, E, R>, mapper: (item: Remote<A, E, R>) => B): Remote<Option.Option<Resolved<B>>, E | PipelineClientError, R>
+export function map(source: Remote<any, any, any>, mapper: (item: Remote<any, any, any>) => unknown): Remote<any, any, any> {
+  if (!isOperation(source)) throw new Error("Pipeline.map requires a remote array or Option")
+  const sourceGraph = source.graph
+  const placeholder = makeRemote({ runtime: sourceGraph.runtime, nodes: [], selection: { _tag: "item", path: [] }, discards: [] })
+  const extra: Graph[] = []
+  const template = encodeValue(mapper(placeholder), sourceGraph.runtime, extra)
+  const id = sourceGraph.runtime.nextId()
+  const node: MapNode = { _tag: "map", id, source: sourceGraph.selection, template, dependencies: [...new Set([...refsIn(sourceGraph.selection), ...refsIn(template)])] }
+  return makeRemote({ runtime: sourceGraph.runtime, nodes: [...mergeNodes(sourceGraph, ...extra), node], selection: { _tag: "ref", id, path: [] }, discards: [] })
 }
 
-/** Builds a Cap'n Web-style graph and resolves its selected outputs in one request. */
-export const resolve = <D extends PipelineDefinition<any>, A>(
-  client: RunnableClient<D>,
-  builder: (api: ClientApi<D["root"] extends RpcGroup.RpcGroup<infer Rpcs> ? Rpcs : never>) => A
-): Effect.Effect<Resolved<A>, unknown, never> =>
-  Effect.try({ try: () => requestFrom(client.definition, builder), catch: (error) => error }).pipe(
-    Effect.flatMap((request) => client[PipelineClientTypeId].execute(request)),
-    Effect.map((value) => value as Resolved<A>)
-  )
+/** Orders `right` after `left` while retaining only the right-hand result. */
+export const zipRight = <A, B, E, E2, R, R2>(left: Remote<A, E, R>, right: Remote<B, E2, R2>): Remote<B, E | E2, R | R2> => {
+  if (!isOperation(left) || !isOperation(right)) throw new Error("Pipeline.zipRight requires two remote operations")
+  assertRuntime(left.graph.runtime, right.graph)
+  const leftIds = refsIn(left.graph.selection)
+  const leftNodeIds = new Set(left.graph.nodes.map((node) => node.id))
+  const orderedRight: Graph = { ...right.graph, nodes: right.graph.nodes.map((node) => leftNodeIds.has(node.id) ? node : ({ ...node, dependencies: [...new Set([...node.dependencies, ...leftIds])] })) }
+  return makeRemote({ runtime: left.graph.runtime, nodes: mergeNodes(left.graph, orderedRight), selection: right.graph.selection, discards: [...leftIds] })
+}
 
-/** Records an ordered generator program and evaluates the resulting graph in one request. */
-export const run = <D extends PipelineDefinition<any>, A>(
-  client: RunnableClient<D>,
-  program: (api: ClientApi<D["root"] extends RpcGroup.RpcGroup<infer Rpcs> ? Rpcs : never>) =>
-    Generator<PipelineRef | Selection<unknown>, A, unknown>
-): Effect.Effect<Resolved<A>, unknown, never> =>
-  Effect.try({ try: () => requestFromGenerator(client.definition, program), catch: (error) => error }).pipe(
-    Effect.flatMap((request) => client[PipelineClientTypeId].execute(request)),
-    Effect.map((value) => value as Resolved<A>)
-  )
-
-export const isPipelineRef = isRef
-export const isDefinition = (u: unknown): u is PipelineDefinition =>
-  typeof u === "object" && u !== null && (u as any)[PipelineDefinitionTypeId] === true
-
+export const isPipelineRef = isOperation
 export const isOption = Option.isOption
