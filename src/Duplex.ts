@@ -31,6 +31,7 @@ export const CapabilityRefSchema: Schema.Schema<CapabilityRef> = Schema.Struct({
 const InvocationSchema = Schema.Struct({
   _tag: Schema.Literal("Invoke"),
   callId: Schema.String,
+  definitionId: Schema.String,
   capabilityId: Schema.String,
   method: Schema.String,
   payload: Schema.optionalKey(Schema.Unknown)
@@ -72,6 +73,7 @@ export const ReplyRpc = Rpc.make("__effect_rpc_pipeline_reply_v1", {
 export const CallServerCapabilityRpc = Rpc.make("__effect_rpc_pipeline_capability_v1", {
   payload: {
     sessionId: Schema.String,
+    definitionId: Schema.String,
     capabilityId: Schema.String,
     method: Schema.String,
     payload: Schema.optionalKey(Schema.Unknown)
@@ -83,6 +85,7 @@ export const CallServerCapabilityRpc = Rpc.make("__effect_rpc_pipeline_capabilit
 export const ReleaseCapabilityRpc = Rpc.make("__effect_rpc_pipeline_release_v1", {
   payload: {
     sessionId: Schema.String,
+    definitionId: Schema.String,
     capabilityId: Schema.String
   },
   success: Schema.Void
@@ -102,12 +105,12 @@ type Session = {
 
 export type ServerService = {
   readonly open: (sessionId: string, clientId: number) => Effect.Effect<Stream.Stream<SessionEvent, never>, DuplexError>
-  readonly reply: (sessionId: string, callId: string, exit: { readonly _tag: "Success" | "Failure"; readonly value?: unknown }) => Effect.Effect<void, DuplexError>
+  readonly reply: (clientId: number, sessionId: string, callId: string, exit: { readonly _tag: "Success" | "Failure"; readonly value?: unknown }) => Effect.Effect<void, DuplexError>
   readonly invokeClient: (clientId: number, ref: CapabilityRef, method: string, payload: unknown) => Effect.Effect<unknown, unknown>
   readonly registerServerCapability: (clientId: number, instance: CapabilityInstance) => CapabilityRef
-  readonly getServerCapability: (clientId: number, capabilityId: string) => CapabilityInstance | undefined
-  readonly callServerCapability: (clientId: number, capabilityId: string, method: string, payload: unknown) => Effect.Effect<unknown, unknown>
-  readonly releaseServerCapability: (clientId: number, capabilityId: string) => void
+  readonly getServerCapability: (clientId: number, sessionId: string | undefined, definitionId: string, capabilityId: string) => CapabilityInstance | undefined
+  readonly callServerCapability: (clientId: number, sessionId: string, definitionId: string, capabilityId: string, method: string, payload: unknown, metadata?: Parameters<Rpc.Handler<string>["handler"]>[1]) => Effect.Effect<unknown, unknown>
+  readonly releaseServerCapability: (clientId: number, sessionId: string, definitionId: string, capabilityId: string) => void
 }
 
 export class Server extends Context.Service<Server, ServerService>()("effect-rpc-pipeline/DuplexServer") {}
@@ -127,7 +130,9 @@ export const makeServer = Effect.sync((): ServerService => {
   return {
     open: (sessionId, clientId) => Effect.gen(function*() {
       const previous = sessionsById.get(sessionId)
-      if (previous !== undefined) close(previous)
+      if (previous !== undefined) return yield* Effect.fail(new DuplexError({ reason: "Duplex session is already open" }))
+      const previousForClient = sessionsByClient.get(clientId)
+      if (previousForClient !== undefined) close(previousForClient)
       const queue = yield* Queue.make<SessionEvent, Cause.Done>()
       const session: Session = { id: sessionId, clientId, queue, pending: new Map(), serverCapabilities: new Map(), nextCallId: 0 }
       sessionsById.set(sessionId, session)
@@ -135,10 +140,12 @@ export const makeServer = Effect.sync((): ServerService => {
       yield* Queue.offer(queue, { _tag: "Ready", sessionId })
       return Stream.fromQueue(queue).pipe(Stream.ensuring(Effect.sync(() => close(session))))
     }),
-    reply: (sessionId, callId, exit) => Effect.suspend(() => {
+    reply: (clientId, sessionId, callId, exit) => Effect.suspend(() => {
       const session = sessionsById.get(sessionId)
       const deferred = session?.pending.get(callId)
-      if (session === undefined || deferred === undefined) return Effect.fail(new DuplexError({ reason: "Unknown callback invocation", sessionId }))
+      if (session === undefined || session.clientId !== clientId || deferred === undefined) {
+        return Effect.fail(new DuplexError({ reason: "Unknown callback invocation" }))
+      }
       session.pending.delete(callId)
       Deferred.doneUnsafe(deferred, exit._tag === "Success" ? Effect.succeed(exit.value) : Effect.fail(exit.value))
       return Effect.void
@@ -153,12 +160,14 @@ export const makeServer = Effect.sync((): ServerService => {
       }
       const session = sessionsByClient.get(clientId)
       if (session === undefined) return yield* Effect.fail(new Capability.CapabilityTransportError({ reason: "WebSocket duplex session is not available", capabilityId: ref.capabilityId }))
+      if (ref.owner !== "client") return yield* Effect.fail(new Capability.CapabilityTransportError({ reason: "Invalid capability owner", capabilityId: ref.capabilityId }))
       const callId = `${session.id}:${session.nextCallId++}`
       const deferred = yield* Deferred.make<unknown, unknown>()
       session.pending.set(callId, deferred)
       yield* Queue.offer(session.queue, {
         _tag: "Invoke",
         callId,
+        definitionId: ref.definitionId,
         capabilityId: ref.capabilityId,
         method,
         ...(payload === undefined ? {} : { payload })
@@ -171,30 +180,42 @@ export const makeServer = Effect.sync((): ServerService => {
     registerServerCapability: (clientId, instance) => {
       const session = sessionsByClient.get(clientId)
       if (session === undefined) throw new DuplexError({ reason: "Persistent capabilities require a WebSocket duplex session", capabilityId: instance.capabilityId })
+      if (instance.owner !== "local") throw new DuplexError({ reason: "Cannot register a peer-owned capability", capabilityId: instance.capabilityId })
       session.serverCapabilities.set(instance.capabilityId, instance)
       return Capability.toRef(instance, "server")
     },
-    getServerCapability: (clientId, capabilityId) => sessionsByClient.get(clientId)?.serverCapabilities.get(capabilityId),
-    callServerCapability: (clientId, capabilityId, method, payload) => Effect.suspend(() => {
+    getServerCapability: (clientId, sessionId, definitionId, capabilityId) => {
       const session = sessionsByClient.get(clientId)
-      const instance = session?.serverCapabilities.get(capabilityId)
-      if (session === undefined || instance === undefined) return Effect.fail(new Capability.CapabilityUnavailable({ reason: "Capability has been released", capabilityId }))
-      return Capability.invokeLocal(instance, method, payload)
+      const instance = session !== undefined && (sessionId === undefined || session.id === sessionId)
+        ? session.serverCapabilities.get(capabilityId)
+        : undefined
+      return instance?.definitionId === definitionId ? instance : undefined
+    },
+    callServerCapability: (clientId, sessionId, definitionId, capabilityId, method, payload, metadata) => Effect.suspend(() => {
+      const session = sessionsByClient.get(clientId)
+      const instance = session?.id === sessionId ? session.serverCapabilities.get(capabilityId) : undefined
+      if (session === undefined || instance === undefined || instance.definitionId !== definitionId) {
+        return Effect.fail(new Capability.CapabilityUnavailable({ reason: "Capability is unavailable", capabilityId }))
+      }
+      return Capability.invokeWire(instance, method, payload, metadata)
     }),
-    releaseServerCapability: (clientId, capabilityId) => {
-      sessionsByClient.get(clientId)?.serverCapabilities.delete(capabilityId)
+    releaseServerCapability: (clientId, sessionId, definitionId, capabilityId) => {
+      const session = sessionsByClient.get(clientId)
+      const instance = session?.id === sessionId ? session.serverCapabilities.get(capabilityId) : undefined
+      if (instance?.definitionId === definitionId) session?.serverCapabilities.delete(capabilityId)
     }
   }
 })
 
 export const handlers = (server: ServerService) => Rpcs.of({
   [SessionRpc._tag]: ({ sessionId }, { client }) => Stream.unwrap(server.open(sessionId, client.id)),
-  [ReplyRpc._tag]: ({ sessionId, callId, exit }) => server.reply(sessionId, callId, exit),
-  [CallServerCapabilityRpc._tag]: ({ capabilityId, method, payload }, { client }) =>
-    server.callServerCapability(client.id, capabilityId, method, payload).pipe(
+  [ReplyRpc._tag]: ({ sessionId, callId, exit }, { client }) => server.reply(client.id, sessionId, callId, exit),
+  [CallServerCapabilityRpc._tag]: ({ sessionId, definitionId, capabilityId, method, payload }, metadata) =>
+    server.callServerCapability(metadata.client.id, sessionId, definitionId, capabilityId, method, payload, metadata).pipe(
       Effect.map((value) => value === undefined ? {} : { value })
     ),
-  [ReleaseCapabilityRpc._tag]: ({ capabilityId }, { client }) => Effect.sync(() => server.releaseServerCapability(client.id, capabilityId))
+  [ReleaseCapabilityRpc._tag]: ({ sessionId, definitionId, capabilityId }, { client }) =>
+    Effect.sync(() => server.releaseServerCapability(client.id, sessionId, definitionId, capabilityId))
 })
 
 const transform = (value: unknown, f: (ref: CapabilityRef) => unknown, local: (instance: CapabilityInstance) => unknown): unknown => {
@@ -210,14 +231,16 @@ export const resolveServerValue = (server: ServerService, clientId: number, valu
   value,
   (ref) => ref.owner === "client"
     ? Capability.fromRemoteRef(ref, (method, payload) => server.invokeClient(clientId, ref, method, payload))
-    : server.getServerCapability(clientId, ref.capabilityId) ?? ref,
+    : server.getServerCapability(clientId, undefined, ref.definitionId, ref.capabilityId) ?? ref,
   (instance) => instance
 )
 
 export const encodeServerValue = (server: ServerService, clientId: number, value: unknown): unknown => transform(
   value,
   (ref) => ref,
-  (instance) => server.registerServerCapability(clientId, instance)
+  (instance) => instance.owner === "local"
+    ? server.registerServerCapability(clientId, instance)
+    : Capability.toRef(instance, "client")
 )
 
 export type ClientSession = {
@@ -253,11 +276,11 @@ export const makeClientSession = (
         return fiber === undefined ? Effect.void : Fiber.interrupt(fiber).pipe(Effect.asVoid)
       }
       const instance = localCapabilities.get(event.capabilityId)
-      if (instance === undefined) return reply(event.callId, {
+      if (instance === undefined || instance.definitionId !== event.definitionId) return reply(event.callId, {
         _tag: "Failure",
         value: new Capability.CapabilityUnavailable({ capabilityId: event.capabilityId, reason: "Capability has been released" })
       })
-      return Effect.matchEffect(Capability.invokeLocal(instance, event.method, event.payload), {
+      return Effect.matchEffect(Capability.invokeWire(instance, event.method, event.payload), {
         onFailure: (error) => reply(event.callId, { _tag: "Failure", value: error }),
         onSuccess: (value) => reply(event.callId, { _tag: "Success", value })
       }).pipe(
@@ -281,13 +304,16 @@ export const makeClientSession = (
         ref,
         (method, payload) => client[CallServerCapabilityRpc._tag]({
           sessionId,
+          definitionId: ref.definitionId,
           capabilityId: ref.capabilityId,
           method,
           ...(payload === undefined ? {} : { payload })
         }).pipe(Effect.map(({ value }) => value)),
-        client[ReleaseCapabilityRpc._tag]({ sessionId, capabilityId: ref.capabilityId })
+        client[ReleaseCapabilityRpc._tag]({ sessionId, definitionId: ref.definitionId, capabilityId: ref.capabilityId })
       )
-      : localCapabilities.get(ref.capabilityId) ?? ref,
+      : localCapabilities.get(ref.capabilityId)?.definitionId === ref.definitionId
+        ? localCapabilities.get(ref.capabilityId)
+        : ref,
     (instance) => instance
   )
 

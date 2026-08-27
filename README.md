@@ -235,7 +235,7 @@ The callback runs locally while the graph is being built, so `created` is symbol
 
 For simple sequencing where only the second result matters, use `Pipeline.zipRight(first, second)`.
 
-## Headers and Effect RPC middleware
+## Authentication and authorization
 
 Headers use the normal Effect RPC API and apply to the complete pipeline request:
 
@@ -250,11 +250,13 @@ const result = yield* Pipeline.all({
 )
 ```
 
-Standard RPC middleware continues to control server requirements, context injection, authentication, and typed failures:
+Authentication remains ordinary Effect RPC middleware. The optional `Auth` module only handles strict bearer extraction, redaction, and wiring an application-owned verifier into a typed principal service:
 
 ```ts
 import * as Context from "effect/Context"
+import * as Redacted from "effect/Redacted"
 import * as RpcMiddleware from "effect/unstable/rpc/RpcMiddleware"
+import * as Auth from "effect-rpc-pipeline/Auth"
 
 class CurrentUser extends Context.Service<CurrentUser, User>()("app/CurrentUser") {}
 
@@ -262,28 +264,32 @@ class Unauthorized extends Schema.TaggedError<Unauthorized>()("Unauthorized", {
   reason: Schema.String
 }) {}
 
-class Auth extends RpcMiddleware.Service<Auth, {
+class AccessTokenVerifier extends Context.Service<AccessTokenVerifier, {
+  verify: (token: Redacted.Redacted<string>) => Effect.Effect<User, Unauthorized>
+}>()("app/AccessTokenVerifier") {}
+
+class Authenticated extends RpcMiddleware.Service<Authenticated, {
   provides: CurrentUser
-}>()("app/Auth", { error: Unauthorized }) {}
+  requires: AccessTokenVerifier
+}>()("app/Authenticated", { error: Unauthorized, requiredForClient: true }) {}
 
 const PrivateRpcs = RpcGroup.make(
   Rpc.make("me", { success: User }),
   Rpc.make("privateTodos", { success: Schema.Array(Todo) })
-).middleware(Auth)
+).middleware(Authenticated)
 
 const PrivateHandlers = PrivateRpcs.toLayer({
   me: () => CurrentUser,
   privateTodos: () => Effect.flatMap(CurrentUser, (user) => Todos.forUser(user.id))
 })
 
-const AuthLive = Layer.succeed(Auth, (effect, { headers }) => {
-  const token = headers.authorization
-  if (token === undefined) {
-    return Effect.fail(new Unauthorized({ reason: "missing token" }))
-  }
-  return Effect.flatMap(Users.authenticate(token), (user) =>
-    Effect.provideService(effect, CurrentUser, user)
-  )
+const AuthenticatedLive = Auth.layerBearer(Authenticated, {
+  principal: CurrentUser,
+  authenticate: (token) => Effect.flatMap(
+    AccessTokenVerifier,
+    (verifier) => verifier.verify(token)
+  ),
+  unauthorized: () => new Unauthorized({ reason: "invalid credentials" })
 })
 
 const PrivateRoutes = PipelineServer.layerHttp({
@@ -291,11 +297,36 @@ const PrivateRoutes = PipelineServer.layerHttp({
   path: "/rpc"
 }).pipe(
   Layer.provide(PrivateHandlers),
-  Layer.provide(AuthLive)
+  Layer.provide(AuthenticatedLive),
+  Layer.provide(AccessTokenVerifierLive)
 )
 ```
 
-The middleware implementation can read request headers and provide `CurrentUser` around each handler. Server-only requirements do not appear in the client Effect type.
+`Auth.layerBearer` does not verify JWTs itself. Implement `AccessTokenVerifier` with a maintained JOSE/OIDC library and pin the allowed algorithm, issuer, audience, token type, expiration, and required claims. Send bearer credentials only in the `Authorization` header over TLS; never put them in pipeline payloads or URLs. `Redacted` reduces accidental disclosure in logs but is not encryption.
+
+Keep public and protected surfaces explicit, and optionally assert that no RPC was exposed accidentally:
+
+```ts
+const PublicRpcs = RpcGroup.make(Health)
+const PrivateRpcs = RpcGroup.make(Me, ListTodos).middleware(Authenticated)
+const AppRpcs = PublicRpcs.merge(PrivateRpcs)
+
+yield* Auth.assertCoverage(AppRpcs, {
+  public: [Health],
+  protectedBy: Authenticated
+})
+```
+
+Authentication answers who the caller is. Coarse role or scope checks can be another RPC middleware, while resource authorization should stay in the domain operation and constrain the actual read or mutation:
+
+```ts
+updateTodo: ({ id, patch }) => Effect.gen(function*() {
+  const user = yield* CurrentUser
+  return yield* Todos.updateOwnedBy({ ownerId: user.id, id, patch })
+})
+```
+
+Do not authorize from a client-supplied `userId`. Client middleware is a convenience for adding credentials; server middleware is always the security boundary.
 
 Middleware marked `requiredForClient` is also supported. Its client layer is captured when `PipelineClient.make` runs, and one middleware shared by several nodes runs once around the complete batch.
 
@@ -383,22 +414,16 @@ const SessionRpcs = RpcGroup.make(
 
 const Session = Capability.make("app/Session", SessionRpcs)
 
-const AppRpcs = RpcGroup.make(
-  Rpc.make("authenticate", {
-    payload: { token: Schema.String },
-    success: Session.schema,
-    error: Unauthorized
-  })
-)
+const OpenSession = Rpc.make("openSession", { success: Session.schema })
+const AppRpcs = RpcGroup.make(OpenSession).middleware(Authenticated)
 ```
 
 The server returns an implementation with `fromHandlers`:
 
 ```ts
 const AppHandlers = AppRpcs.of({
-  authenticate: ({ token }) => Effect.gen(function*() {
-    const user = yield* Users.authenticate(token)
-
+  openSession: () => Effect.gen(function*() {
+    const user = yield* CurrentUser
     return yield* Session.fromHandlers({
       currentUser: () => CurrentUser,
       listTodos: () => Effect.flatMap(CurrentUser, (user) => Todos.forUser(user.id)),
@@ -416,7 +441,9 @@ const AppHandlers = AppRpcs.of({
 The client code consequently describes intent instead of authentication plumbing:
 
 ```ts
-const session = yield* rpc.authenticate({ token })
+const session = yield* rpc.openSession().pipe(
+  RpcClient.withHeaders({ authorization: `Bearer ${token}` })
+)
 
 const result = yield* Effect.gen(function*() {
   const todo = yield* session.createTodo({ title: "Learn Effect" })
@@ -425,7 +452,7 @@ const result = yield* Effect.gen(function*() {
 })
 ```
 
-With a bearer-token API, both calls would normally accept the token and every handler would need to authenticate or recover the current user. The capability performs that transition once: possession of `session` is the authority to call exactly `SessionRpcs` for the captured user.
+Authentication happens before the capability is minted. Possession of `session` is then the authority to call exactly `SessionRpcs` for the captured user; the raw JWT is not stored in the capability or repeated in its payloads.
 
 This also makes least-authority APIs natural. Instead of returning a session with every application RPC, return a narrower capability for the task:
 
@@ -454,7 +481,9 @@ An `openTodo` handler can capture the validated todo ID and current user when it
 Over WebSocket, the returned capability can be retained and called in later requests:
 
 ```ts
-const session = yield* rpc.authenticate({ token })
+const session = yield* rpc.openSession().pipe(
+  RpcClient.withHeaders({ authorization: `Bearer ${token}` })
+)
 const user = yield* session.currentUser()
 const todos = yield* session.listTodos()
 
@@ -466,12 +495,12 @@ The capability is scoped to its connection and is revoked automatically when tha
 Over HTTP, use the capability inside the pipeline that creates it:
 
 ```ts
-const session = rpc.authenticate({ token })
+const session = rpc.openSession()
 
 const account = yield* Pipeline.all({
   user: session.currentUser(),
   todos: session.listTodos()
-})
+}).pipe(RpcClient.withHeaders({ authorization: `Bearer ${token}` }))
 ```
 
 An HTTP capability cannot be retained for another request.
@@ -480,18 +509,18 @@ This gives capabilities two useful lifetimes:
 
 | Transport | Lifetime | Typical use |
 | --- | --- | --- |
-| WebSocket | Until release or disconnect | Login sessions, resource handles, and callbacks |
+| WebSocket | Until release or disconnect | Delegated sessions, resource handles, and callbacks |
 | HTTP | The pipeline that creates the capability | Authenticate and perform dependent work in one round trip |
 
 Because capability methods are normal remote values, they compose with the rest of the pipeline API. Authentication and the authorized work can be sent as one dependency graph:
 
 ```ts
-const session = rpc.authenticate({ token })
+const session = rpc.openSession()
 
 const dashboard = yield* Pipeline.all({
   user: session.currentUser(),
   todos: session.listTodos()
-})
+}).pipe(RpcClient.withHeaders({ authorization: `Bearer ${token}` }))
 ```
 
 The server authenticates first and then runs the independent session calls concurrently. The client receives only `dashboard`; the intermediate capability reference does not have to be returned.
@@ -650,6 +679,9 @@ Use a normal streaming RPC when the server only needs to publish a sequence of v
 
 Capabilities are intentionally connection-scoped rather than durable identities:
 
+- capability identifiers are random opaque authority values and are bound to their connection, duplex session, owner, and exact capability definition;
+- payloads, successes, and declared failures are schema-validated in both directions, and malformed peer values fail with `CapabilityTransportError`;
+- returning a capability as an HTTP result is rejected; HTTP capabilities must remain intermediate values inside the pipeline that creates them;
 - reconnection does not replay mutations, recreate capabilities, or resubscribe streams; applications should explicitly re-authenticate and resubscribe;
 - releasing a remote capability makes later calls fail with `CapabilityUnavailable`;
 - disconnects and reverse-call transport failures are represented by `CapabilityTransportError`; and
@@ -891,14 +923,33 @@ This path is useful for unit tests and framework adapters. Native streaming and 
 - Independent nodes execute concurrently; dependencies and `andThen` phases preserve ordering.
 - Values from different `PipelineClient` instances cannot be combined into one graph.
 - Pipelines currently accept JSON-compatible literal data, arrays, objects, and Effect `Option` values.
-- A server rejects malformed graphs, unknown methods, cycles, and graphs larger than 1,000 nodes.
+- A server rejects malformed graphs, unknown methods, cycles, and requests that exceed its execution limits.
 - Pipelines provide ordering, not isolation. Use a transaction when follow-up reads must observe a transactional mutation.
+
+The defaults allow 1,000 graph nodes, 1,000 items in one remote map, 10,000 total RPC invocations, and 64 concurrent invocations. Tighten them for the cost profile of your API:
+
+```ts
+PipelineServer.layerHttp({
+  group: AppRpcs,
+  path: "/rpc",
+  limits: {
+    maxNodes: 250,
+    maxMapItems: 100,
+    maxInvocations: 500,
+    concurrency: 16
+  }
+})
+```
+
+Use the generic server middleware integration for rate limits and quotas. Authentication identifies the caller; it does not by itself limit how much work an authenticated caller may request.
 
 ## TodoMVC example
 
 [`examples/todoapp`](./examples/todoapp) contains a complete TodoMVC implementation with:
 
 - standard Effect RPC schemas and handlers;
+- JWT bearer authentication through native RPC middleware and a typed `CurrentUser` service;
+- per-user storage and stream isolation, with invalid-token and cross-user end-to-end tests;
 - mutation-plus-query responses;
 - native Effect tracing and metrics through the server middleware integration;
 - HTTP and WebSocket servers on one route;

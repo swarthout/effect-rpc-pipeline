@@ -10,7 +10,7 @@ import type * as HttpRouter from "effect/unstable/http/HttpRouter"
 import * as Schema from "effect/Schema"
 import * as Layer from "effect/Layer"
 import type { CapabilityInstance } from "./Capability.js"
-import { isInstance } from "./Capability.js"
+import { isInstance, isRef } from "./Capability.js"
 import * as Duplex from "./Duplex.js"
 import { PipelineExecutionError, PipelineProtocolError, type Expr, type PipelineNode, type PipelineRequest } from "./Pipeline.js"
 import type { PipelineResponse } from "./PipelineClient.js"
@@ -63,7 +63,30 @@ type MiddlewaresRequirements<M extends ReadonlyArray<Middleware<any, any>>> = Mi
 export interface ServerOptions<M extends ReadonlyArray<Middleware<any, any>> = readonly []> {
   readonly id?: string
   readonly middleware?: M
+  readonly limits?: {
+    readonly maxNodes?: number
+    readonly maxMapItems?: number
+    readonly maxInvocations?: number
+    readonly concurrency?: number
+  }
 }
+
+interface ExecutionLimits {
+  readonly maxNodes: number
+  readonly maxMapItems: number
+  readonly maxInvocations: number
+  readonly concurrency: number
+}
+
+const positiveLimit = (value: number | undefined, fallback: number): number =>
+  value === undefined || !Number.isFinite(value) || value < 1 ? fallback : Math.floor(value)
+
+const executionLimits = (options?: ServerOptions<any>): ExecutionLimits => ({
+  maxNodes: positiveLimit(options?.limits?.maxNodes, 1000),
+  maxMapItems: positiveLimit(options?.limits?.maxMapItems, 1000),
+  maxInvocations: positiveLimit(options?.limits?.maxInvocations, 10_000),
+  concurrency: positiveLimit(options?.limits?.concurrency, 64)
+})
 
 const PathSchema = Schema.Array(Schema.Union([Schema.String, Schema.Number]))
 export const ExprSchema: Schema.Schema<Expr> = Schema.suspend(() => Schema.Union([
@@ -167,6 +190,7 @@ interface ExecutionPlan<R extends Rpc.Any> {
   readonly nodeIndex: ReadonlyMap<string, PipelineNode>
   readonly executable: ReadonlyArray<PipelineNode>
   readonly rpcTags: ReadonlyArray<string>
+  readonly limits: ExecutionLimits
 }
 
 const expressionsFor = (node: PipelineNode): ReadonlyArray<Expr> => node._tag === "map"
@@ -176,12 +200,13 @@ const expressionsFor = (node: PipelineNode): ReadonlyArray<Expr> => node._tag ==
 const compilePipeline = <R extends Rpc.Any>(
   group: RpcGroup.RpcGroup<R>,
   request: PipelineRequest,
-  options?: { readonly id?: string }
+  options?: ServerOptions<any>
 ): Effect.Effect<ExecutionPlan<R>, PipelineProtocolError> => Effect.try({
   try: () => {
     const definition: ServerDefinition<R> = { id: options?.id ?? "default", root: group }
+    const limits = executionLimits(options)
     if (request.version !== 1 || request.definitionId !== definition.id) throw new PipelineProtocolError("Unsupported pipeline definition or version")
-    if (request.nodes.length > 1000) throw new PipelineProtocolError("Pipeline node limit exceeded", "LimitExceeded")
+    if (request.nodes.length > limits.maxNodes) throw new PipelineProtocolError("Pipeline node limit exceeded", "LimitExceeded")
     const nodeIndex = new Map(request.nodes.map((node) => [node.id, node]))
     if (nodeIndex.size !== request.nodes.length) throw new PipelineProtocolError("Duplicate pipeline node id", "InvalidPipeline")
 
@@ -221,7 +246,8 @@ const compilePipeline = <R extends Rpc.Any>(
       request,
       nodeIndex,
       executable,
-      rpcTags: [...new Set(request.nodes.filter((node): node is Extract<PipelineNode, { readonly _tag: "call" }> => node._tag === "call").map((node) => node.method))]
+      rpcTags: [...new Set(request.nodes.filter((node): node is Extract<PipelineNode, { readonly _tag: "call" }> => node._tag === "call").map((node) => node.method))],
+      limits
     }
   },
   catch: (error) => error instanceof PipelineProtocolError
@@ -238,6 +264,7 @@ const executeNode = <R extends Rpc.Any>(
   middleware: ReadonlyArray<Middleware<any, any>>,
   executionContext: ExecutionContext<R>,
   invocationSequence: { value: number },
+  limits: ExecutionLimits,
   item?: unknown,
   nodeIndex: ReadonlyMap<string, PipelineNode> = new Map()
 ): Effect.Effect<void, unknown, any> => {
@@ -251,12 +278,15 @@ const executeNode = <R extends Rpc.Any>(
           for (const ref of refsIn(node.template)) {
             const child = nodeIndex.get(ref)
             if (child && (!itemValues.has(ref) || (child._tag === "call" && (containsItem(child.payload) || (child.target ? containsItem(child.target) : false))))) {
-              yield* executeNode(definition, child, itemValues, context, metadata, middleware, executionContext, invocationSequence, item, nodeIndex)
+              yield* executeNode(definition, child, itemValues, context, metadata, middleware, executionContext, invocationSequence, limits, item, nodeIndex)
             }
           }
           return yield* Effect.try({ try: () => evalExpr(node.template, itemValues, item), catch: (error) => error })
         })
-        if (Array.isArray(source)) return Effect.forEach(source, run, { concurrency: "unbounded" }).pipe(Effect.map((result) => { values.set(node.id, result); return undefined }))
+        if (Array.isArray(source)) {
+          if (source.length > limits.maxMapItems) return Effect.fail(new PipelineProtocolError("Pipeline map item limit exceeded", "LimitExceeded"))
+          return Effect.forEach(source, run, { concurrency: limits.concurrency }).pipe(Effect.map((result) => { values.set(node.id, result); return undefined }))
+        }
         if (Option.isOption(source)) return Option.isNone(source) ? Effect.succeed(values.set(node.id, source) as unknown as void) : run(source.value).pipe(Effect.map((result) => { values.set(node.id, Option.some(result)); return undefined }))
         return Effect.fail(new PipelineProtocolError("Pipeline.map only supports arrays and Option", "InvalidMapInput"))
       })
@@ -289,6 +319,7 @@ const executeNode = <R extends Rpc.Any>(
           const result = yield* program
           values.set(node.id, result)
         })
+        if (invocationSequence.value >= limits.maxInvocations) return Effect.fail(new PipelineProtocolError("Pipeline invocation limit exceeded", "LimitExceeded"))
         return applyMiddleware(middleware, "invocation", invocation, {
           ...executionContext,
           nodeId: node.id,
@@ -314,6 +345,7 @@ const executeNode = <R extends Rpc.Any>(
         const result = yield* program
         values.set(node.id, result)
       })
+      if (invocationSequence.value >= limits.maxInvocations) return Effect.fail(new PipelineProtocolError("Pipeline invocation limit exceeded", "LimitExceeded"))
       return applyMiddleware(middleware, "invocation", invocation, {
         ...executionContext,
         nodeId: node.id,
@@ -352,10 +384,11 @@ const executePipeline = <R extends Rpc.Any>(
       middleware,
       executionContext,
       invocationSequence,
+      plan.limits,
       undefined,
       plan.nodeIndex
     ), {
-      concurrency: "unbounded"
+      concurrency: plan.limits.concurrency
     }).pipe(Effect.flatMap(executeReady), Effect.asVoid)
   }
   return executeReady().pipe(
@@ -364,6 +397,16 @@ const executePipeline = <R extends Rpc.Any>(
       catch: (error) => error
     }))
   ) as Effect.Effect<unknown, unknown, never>
+}
+
+const containsCapability = (value: unknown, seen = new WeakSet<object>()): boolean => {
+  if (isInstance(value) || isRef(value)) return true
+  if (value === null || typeof value !== "object") return false
+  if (seen.has(value)) return false
+  seen.add(value)
+  if (Option.isOption(value)) return Option.isSome(value) && containsCapability(value.value, seen)
+  if (Array.isArray(value)) return value.some((item) => containsCapability(item, seen))
+  return Object.values(value).some((item) => containsCapability(item, seen))
 }
 
 const handleWithContext = <R extends Rpc.Any, M extends ReadonlyArray<Middleware<any, any>>>(
@@ -380,7 +423,7 @@ const handleWithContext = <R extends Rpc.Any, M extends ReadonlyArray<Middleware
     middleware,
     "request",
     Effect.flatMap(
-      compilePipeline(group, request, options?.id === undefined ? undefined : { id: options.id }),
+      compilePipeline(group, request, options),
       (plan) => {
         const executionContext: ExecutionContext<R> = { ...requestContext, rpcTags: plan.rpcTags }
         return applyMiddleware(
@@ -395,12 +438,15 @@ const handleWithContext = <R extends Rpc.Any, M extends ReadonlyArray<Middleware
   )
   return wrapped.pipe(
     Effect.provideContext(scopedContext),
-    Effect.map((value): PipelineResponse => {
+    Effect.flatMap((value): Effect.Effect<PipelineResponse, PipelineProtocolError> => {
       const duplex = Context.getOrUndefined(scopedContext, Duplex.Server)
-      return {
+      if (duplex === undefined && containsCapability(value)) {
+        return Effect.fail(new PipelineProtocolError("Capabilities require the WebSocket duplex transport", "UnsupportedRpc"))
+      }
+      return Effect.succeed({
         _tag: "Success",
         value: duplex === undefined ? value : Duplex.encodeServerValue(duplex, metadata.client.id, value)
-      }
+      })
     }),
     Effect.catch((error): Effect.Effect<PipelineResponse> => Effect.succeed({ _tag: "Failure", error }))
   ) as Effect.Effect<PipelineResponse, never, never>

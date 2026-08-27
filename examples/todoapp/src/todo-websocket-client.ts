@@ -5,9 +5,11 @@ import * as PipelineClient from "effect-rpc-pipeline/PipelineClient"
 import * as RpcSerialization from "effect/unstable/rpc/RpcSerialization"
 import * as Socket from "effect/unstable/socket/Socket"
 import { makeLiveTodoClient } from "./todo-client.js"
+import { makeAccessToken } from "./todo-auth.js"
 
 const program = Effect.scoped(Effect.gen(function*() {
-  const todos = yield* makeLiveTodoClient()
+  const token = yield* Effect.promise(() => makeAccessToken({ id: "user-1", name: "Ada" }))
+  const todos = yield* makeLiveTodoClient(token)
   const events = yield* todos.watch().pipe(
     Stream.runForEach((event) => Effect.log("todo update", event)),
     Effect.forkScoped

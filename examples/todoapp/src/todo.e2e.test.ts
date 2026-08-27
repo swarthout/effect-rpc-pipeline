@@ -16,6 +16,7 @@ import { makeLiveTodoClient, makeTodoClient } from "./todo-client.js"
 import type { TodoClient } from "./todo-client.js"
 import type { Server } from "node:http"
 import { TodoLiveRoutes } from "./todo-live.js"
+import { makeAccessToken } from "./todo-auth.js"
 
 describe("TodoMVC end-to-end", () => {
   let server: Server
@@ -28,7 +29,8 @@ describe("TodoMVC end-to-end", () => {
     await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve))
     const address = server.address()
     if (!address || typeof address === "string") throw new Error("Server did not expose a port")
-    client = await Effect.runPromise(makeTodoClient(`http://127.0.0.1:${address.port}/rpc`))
+    const token = await makeAccessToken({ id: "user-1", name: "Ada" })
+    client = await Effect.runPromise(makeTodoClient(`http://127.0.0.1:${address.port}/rpc`, token))
   })
   afterAll(async () => { await new Promise<void>((resolve, reject) => server.close((error) => error ? reject(error) : resolve())) })
 
@@ -85,6 +87,29 @@ describe("TodoMVC end-to-end", () => {
     expect(state.todos).toEqual(before.todos)
   })
 
+  it("rejects invalid JWTs and isolates todo ownership", async () => {
+    const address = server.address()
+    if (!address || typeof address === "string") throw new Error("Server did not expose a port")
+    const url = `http://127.0.0.1:${address.port}/rpc`
+    const invalidClient = await Effect.runPromise(makeTodoClient(url, "invalid.jwt.value"))
+    const unauthorized = await Effect.runPromise(Effect.flip(invalidClient.snapshot()))
+    expect(unauthorized).toMatchObject({ _tag: "Unauthorized" })
+
+    const adaState = await Effect.runPromise(client.add("Private to Ada"))
+    const adaTodo = adaState.todos.find((todo) => todo.title === "Private to Ada")!
+    const graceToken = await makeAccessToken({ id: "user-2", name: "Grace" })
+    const grace = await Effect.runPromise(makeTodoClient(url, graceToken))
+    expect((await Effect.runPromise(grace.snapshot())).todos).toEqual([])
+    const forbiddenResource = await Effect.runPromise(Effect.flip(grace.edit(adaTodo, "Stolen")))
+    expect(forbiddenResource).toMatchObject({ _tag: "TodoNotFound", id: adaTodo.id })
+
+    const readOnlyToken = await makeAccessToken({ id: "user-3", name: "Linus" }, "15 minutes", ["todos:read"])
+    const readOnly = await Effect.runPromise(makeTodoClient(url, readOnlyToken))
+    expect((await Effect.runPromise(readOnly.snapshot())).todos).toEqual([])
+    const insufficientScope = await Effect.runPromise(Effect.flip(readOnly.add("Cannot write")))
+    expect(insufficientScope).toMatchObject({ _tag: "Forbidden" })
+  })
+
   it("streams TodoMVC changes over the native WebSocket transport", async () => {
     const result = await Effect.runPromise(Effect.scoped(Effect.gen(function*() {
       const ServerLive = HttpRouter.serve(TodoLiveRoutes, {
@@ -98,9 +123,10 @@ describe("TodoMVC end-to-end", () => {
       const liveServer = Context.get(serverContext, HttpServer.HttpServer)
       if (liveServer.address._tag !== "TcpAddress") return yield* Effect.die("Expected TCP test server")
       const url = `ws://127.0.0.1:${liveServer.address.port}/rpc`
+      const token = yield* Effect.promise(() => makeAccessToken({ id: "user-1", name: "Ada" }))
 
       return yield* Effect.gen(function*() {
-        const todos = yield* makeLiveTodoClient()
+        const todos = yield* makeLiveTodoClient(token)
         const events = yield* Queue.unbounded<unknown>()
         yield* todos.watch().pipe(
           Stream.runForEach((event) => Queue.offer(events, event)),

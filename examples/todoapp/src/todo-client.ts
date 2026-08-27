@@ -4,7 +4,8 @@ import type * as RpcGroup from "effect/unstable/rpc/RpcGroup"
 import * as Pipeline from "effect-rpc-pipeline/Pipeline"
 import * as PipelineClient from "effect-rpc-pipeline/PipelineClient"
 import type { PipelineRequest } from "effect-rpc-pipeline/Pipeline"
-import { makeTodoState, TodoRpcs, type Todo, type TodoEvent, type TodoFilter, type TodoState } from "./todo.js"
+import { AppRpcs, makeTodoState, type Todo, type TodoEvent, type TodoFilter, type TodoState } from "./todo.js"
+import { clientAuthLayer } from "./todo-auth.js"
 
 export type TodoClient = {
   readonly snapshot: (filter?: TodoFilter) => Effect.Effect<TodoState, unknown>
@@ -20,7 +21,7 @@ export type LiveTodoClient = TodoClient & {
   readonly watch: (filter?: TodoFilter) => Stream.Stream<TodoEvent, unknown>
 }
 
-type TodoRpcClient = Pipeline.ClientApi<RpcGroup.Rpcs<typeof TodoRpcs>>
+type TodoRpcClient = Pipeline.ClientApi<RpcGroup.Rpcs<typeof AppRpcs>>
 
 const fromRpc = (rpc: TodoRpcClient): TodoClient => {
 
@@ -62,13 +63,13 @@ const httpTransport = (url: string): Pipeline.PipelineTransport => (request: Pip
 }) as any
 
 /** TodoMVC facade for the standalone raw-HTTP example server. */
-export const makeTodoClient = (url: string): Effect.Effect<TodoClient> => Effect.map(
-  PipelineClient.make(TodoRpcs, { transport: httpTransport(url), id: "todo-mvc" }),
+export const makeTodoClient = (url: string, token: string): Effect.Effect<TodoClient> => Effect.map(
+  PipelineClient.make(AppRpcs, { transport: httpTransport(url), id: "todo-mvc" }).pipe(Effect.provide(clientAuthLayer(token))),
   fromRpc
 )
 
 /** Native client for use inside a PipelineClient HTTP or WebSocket layer scope. */
-export const makeLiveTodoClient = () => Effect.map(
-  PipelineClient.make(TodoRpcs, { id: "todo-mvc" }),
+export const makeLiveTodoClient = (token: string) => Effect.map(
+  PipelineClient.make(AppRpcs, { id: "todo-mvc" }).pipe(Effect.provide(clientAuthLayer(token))),
   (rpc) => ({ ...fromRpc(rpc), watch: (filter: TodoFilter = "all") => rpc.watchTodos({ filter }) })
 )

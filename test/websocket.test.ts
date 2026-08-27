@@ -40,7 +40,8 @@ describe("native Effect WebSocket transport", () => {
       }),
       Rpc.make("authenticate", {
         payload: { token: Schema.String },
-        success: AuthedApi.schema
+        success: AuthedApi.schema,
+        error: Schema.Literal("Unauthorized")
       })
     )
 
@@ -57,9 +58,9 @@ describe("native Effect WebSocket transport", () => {
         list: () => Effect.sync(() => [...values]),
         watch: () => Stream.unwrap(Effect.as(Deferred.succeed(subscribed, undefined), Stream.fromPubSub(changes))),
         confirmAdd: ({ title, approval }) => approval.approve({ title }),
-        authenticate: ({ token }) => AuthedApi.fromHandlers({
-          currentUser: () => Effect.succeed(token === "secret" ? "user-1" : "guest")
-        })
+        authenticate: ({ token }) => token !== "secret"
+          ? Effect.fail("Unauthorized" as const)
+          : AuthedApi.fromHandlers({ currentUser: () => Effect.succeed("user-1") })
       })
       const HandlerLive = Layer.effectContext(App.toHandlers(handlers) as Effect.Effect<Context.Context<any>>)
       const Routes = Layer.merge(
