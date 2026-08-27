@@ -40,6 +40,14 @@
     "./RequestBatching": {
       "types": "./dist/RequestBatching.d.mts",
       "import": "./dist/RequestBatching.mjs"
+    },
+    "./Sql": {
+      "types": "./dist/Sql.d.mts",
+      "import": "./dist/Sql.mjs"
+    },
+    "./Telemetry": {
+      "types": "./dist/Telemetry.d.mts",
+      "import": "./dist/Telemetry.mjs"
     }
   },
   "scripts": {

@@ -14,12 +14,14 @@ import type { RpcClientError } from "effect/unstable/rpc/RpcClientError"
 import * as RpcGroup from "effect/unstable/rpc/RpcGroup"
 import * as RpcMiddleware from "effect/unstable/rpc/RpcMiddleware"
 import * as SqlClient from "effect/unstable/sql/SqlClient"
+import * as SqlError from "effect/unstable/sql/SqlError"
 import { describe, expect, expectTypeOf, it } from "vitest"
 import * as Capability from "../src/Capability.js"
 import * as Pipeline from "../src/Pipeline.js"
 import * as PipelineClient from "../src/PipelineClient.js"
 import * as PipelineServer from "../src/PipelineServer.js"
 import * as RequestBatching from "../src/RequestBatching.js"
+import * as PipelineSql from "../src/Sql.js"
 
 const local = async <Rpcs extends Rpc.Any>(group: RpcGroup.RpcGroup<Rpcs>, handlers: any, id = "default") => {
   const context = await Effect.runPromise(group.toHandlers(handlers) as Effect.Effect<any>)
@@ -247,10 +249,10 @@ describe("Effect-native pipeline client", () => {
     const mapped = Pipeline.map(client.findUsers(), (user) => client.loadProfile({ id: user.id }))
 
     expectTypeOf<Effect.Error<typeof dependent>>().toEqualTypeOf<
-      FindUserError | LoadProfileError | RpcClientError | Pipeline.PipelineProtocolError
+      FindUserError | LoadProfileError | RpcClientError | Pipeline.PipelineProtocolError | Pipeline.PipelineExecutionError
     >()
     expectTypeOf<Effect.Error<typeof mapped>>().toEqualTypeOf<
-      FindUserError | LoadProfileError | RpcClientError | Pipeline.PipelineProtocolError
+      FindUserError | LoadProfileError | RpcClientError | Pipeline.PipelineProtocolError | Pipeline.PipelineExecutionError
     >()
     expect(await Effect.runPromise(mapped)).toEqual(["profile:u1"])
   })
@@ -363,7 +365,7 @@ describe("Effect-native pipeline client", () => {
     const call = Pipeline.all({ me: client.me(), roles: client.roles() })
 
     expectTypeOf<Effect.Error<typeof call>>().toEqualTypeOf<
-      Unauthorized | MissingToken | RpcClientError | Pipeline.PipelineProtocolError
+      Unauthorized | MissingToken | RpcClientError | Pipeline.PipelineProtocolError | Pipeline.PipelineExecutionError
     >()
     expect(await Effect.runPromise(call)).toEqual({ me: "client-user", roles: ["admin"] })
     expect(middlewareRuns).toBe(1)
@@ -658,7 +660,7 @@ describe("request batching and transactional execution", () => {
     } as SqlClient.SqlClient
     const client = await Effect.runPromise(PipelineClient.make(App, {
       transport: (request) => PipelineServer.handle(App, request, {
-        aroundExecution: PipelineServer.sqlTransaction
+        middleware: [PipelineSql.transaction()]
       }).pipe(
         Effect.provideService(SqlClient.SqlClient, sql),
         Effect.provideContext(handlers)
@@ -674,6 +676,45 @@ describe("request batching and transactional execution", () => {
     expect(failure).toMatchObject({ _tag: "MutationFailed" })
     expect(value).toBe(1)
     expect(events).toEqual(["begin:tx-1", "commit:tx-1", "begin:tx-2", "rollback:tx-2"])
+
+    const invalid = await Effect.runPromise(PipelineServer.handle(App, {
+      version: 1,
+      definitionId: "wrong",
+      nodes: [],
+      selection: { _tag: "literal" },
+      discards: []
+    }, { middleware: [PipelineSql.transaction()] }).pipe(
+      Effect.provideService(SqlClient.SqlClient, sql),
+      Effect.provideContext(handlers)
+    ))
+    expect(invalid).toMatchObject({ _tag: "Failure", error: { _tag: "PipelineProtocolError" } })
+    expect(events).toEqual(["begin:tx-1", "commit:tx-1", "begin:tx-2", "rollback:tx-2"])
+  })
+
+  it("returns a stable execution error when transaction infrastructure fails", async () => {
+    const App = RpcGroup.make(Rpc.make("value", { success: Schema.Number }))
+    const handlers = await Effect.runPromise(App.toHandlers({ value: () => Effect.succeed(1) }))
+    const sql = {
+      withTransaction: () => Effect.fail(new SqlError.SqlError({
+        reason: new SqlError.ConnectionError({ cause: "database unavailable" })
+      }))
+    } as unknown as SqlClient.SqlClient
+    const client = await Effect.runPromise(PipelineClient.make(App, {
+      transport: (request) => PipelineServer.handle(App, request, {
+        middleware: [PipelineSql.transaction()]
+      }).pipe(
+        Effect.provideService(SqlClient.SqlClient, sql),
+        Effect.provideContext(handlers)
+      )
+    }))
+
+    const error = await Effect.runPromise(Effect.flip(client.value()))
+    expect(error).toMatchObject({
+      _tag: "PipelineExecutionError",
+      code: "TransactionFailed",
+      retryable: true
+    })
+    expect(String(error)).not.toContain("database unavailable")
   })
 })
 

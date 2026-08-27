@@ -44,6 +44,8 @@ import * as Pipeline from "effect-rpc-pipeline/Pipeline"
 import * as PipelineClient from "effect-rpc-pipeline/PipelineClient"
 import * as PipelineServer from "effect-rpc-pipeline/PipelineServer"
 import * as RequestBatching from "effect-rpc-pipeline/RequestBatching"
+import * as PipelineSql from "effect-rpc-pipeline/Sql"
+import * as PipelineTelemetry from "effect-rpc-pipeline/Telemetry"
 ```
 
 They are also available as namespaces from `effect-rpc-pipeline`.
@@ -354,7 +356,16 @@ Streams have an independent, backpressured lifetime and cannot be embedded in fi
 
 ## Typed capabilities
 
-A capability is an RPC client that can itself be sent across the connection. Capabilities provide Cap'n Web-style authenticated objects and typed callbacks without serializing JavaScript functions.
+A capability is a typed RPC client that can itself be sent as an RPC value. It combines two ideas:
+
+- a surface of methods, defined by an ordinary Effect `RpcGroup`; and
+- authority to call one particular implementation of those methods.
+
+This is useful whenever a plain data response would force later calls to repeat context. An authenticated session, a handle to one document, a restricted administrative surface, or a client callback can all be represented by the same abstraction. The receiver gets an ordinary, strongly typed Effect RPC client; no JavaScript functions or closures are serialized.
+
+Capability references are opaque protocol values. The handlers and their captured Effect context remain on the side that created the capability. Calling a method sends the capability identity, method name, and schema-encoded payload back to that side for execution.
+
+### Define a capability
 
 Define a capability from another ordinary `RpcGroup`:
 
@@ -363,7 +374,11 @@ import * as Capability from "effect-rpc-pipeline/Capability"
 
 const SessionRpcs = RpcGroup.make(
   Rpc.make("currentUser", { success: User }),
-  Rpc.make("listTodos", { success: Schema.Array(Todo) })
+  Rpc.make("listTodos", { success: Schema.Array(Todo) }),
+  Rpc.make("createTodo", {
+    payload: { title: Schema.String },
+    success: Todo
+  })
 )
 
 const Session = Capability.make("app/Session", SessionRpcs)
@@ -385,12 +400,56 @@ const AppHandlers = AppRpcs.of({
     const user = yield* Users.authenticate(token)
 
     return yield* Session.fromHandlers({
-      currentUser: () => Effect.succeed(user),
-      listTodos: () => Todos.forUser(user.id)
-    })
+      currentUser: () => CurrentUser,
+      listTodos: () => Effect.flatMap(CurrentUser, (user) => Todos.forUser(user.id)),
+      createTodo: ({ title }) => Effect.flatMap(
+        CurrentUser,
+        (user) => Todos.create({ ownerId: user.id, title })
+      )
+    }).pipe(Effect.provideService(CurrentUser, user))
   })
 })
 ```
+
+`Session.fromHandlers` uses the same handler definitions, middleware, errors, and service requirements as `RpcGroup.toHandlers`. It also captures the Effect context in which the capability is created. In this example, each returned session has its own `CurrentUser`; session methods do not need a token or user ID in every payload, and concurrent sessions cannot accidentally read one another's user service.
+
+The client code consequently describes intent instead of authentication plumbing:
+
+```ts
+const session = yield* rpc.authenticate({ token })
+
+const result = yield* Effect.gen(function*() {
+  const todo = yield* session.createTodo({ title: "Learn Effect" })
+  const todos = yield* session.listTodos()
+  return { todo, todos }
+})
+```
+
+With a bearer-token API, both calls would normally accept the token and every handler would need to authenticate or recover the current user. The capability performs that transition once: possession of `session` is the authority to call exactly `SessionRpcs` for the captured user.
+
+This also makes least-authority APIs natural. Instead of returning a session with every application RPC, return a narrower capability for the task:
+
+```ts
+const TodoEditorRpcs = RpcGroup.make(
+  Rpc.make("rename", {
+    payload: { title: Schema.String },
+    success: Todo
+  }),
+  Rpc.make("complete", { success: Todo })
+)
+
+const TodoEditor = Capability.make("todos/Editor", TodoEditorRpcs)
+
+const openTodo = Rpc.make("openTodo", {
+  payload: { id: Schema.String },
+  success: TodoEditor.schema,
+  error: TodoNotFound
+})
+```
+
+An `openTodo` handler can capture the validated todo ID and current user when it creates the editor. Its `rename` method then needs only the new title, and a caller holding the editor cannot list other users' todos or invoke unrelated application methods.
+
+### Connection lifetime and pipelining
 
 Over WebSocket, the returned capability can be retained and called in later requests:
 
@@ -417,11 +476,31 @@ const account = yield* Pipeline.all({
 
 An HTTP capability cannot be retained for another request.
 
-Capability handlers preserve their RPC schemas, middleware, errors, and captured Effect context.
+This gives capabilities two useful lifetimes:
+
+| Transport | Lifetime | Typical use |
+| --- | --- | --- |
+| WebSocket | Until release or disconnect | Login sessions, resource handles, and callbacks |
+| HTTP | The pipeline that creates the capability | Authenticate and perform dependent work in one round trip |
+
+Because capability methods are normal remote values, they compose with the rest of the pipeline API. Authentication and the authorized work can be sent as one dependency graph:
+
+```ts
+const session = rpc.authenticate({ token })
+
+const dashboard = yield* Pipeline.all({
+  user: session.currentUser(),
+  todos: session.listTodos()
+})
+```
+
+The server authenticates first and then runs the independent session calls concurrently. The client receives only `dashboard`; the intermediate capability reference does not have to be returned.
 
 ### Client callbacks
 
-The same mechanism lets the server call a typed interface supplied by the client:
+Capabilities are bidirectional over WebSocket. A client can implement a capability, include it in a request, and let the server call it. This provides typed callbacks without callback URLs, a second protocol, polling, or function serialization.
+
+The simplest example is an interactive approval during checkout:
 
 ```ts
 const ApprovalRpcs = RpcGroup.make(
@@ -475,9 +554,106 @@ const approval = yield* Approval.fromHandlers({
 const receipt = yield* rpc.checkout({ cartId, approval })
 ```
 
-The server receives `approval` as a typed RPC client and calls `yield* approval.approve(...)`. Calls can run concurrently, typed failures travel in either direction, and interruption of a server wait interrupts the client callback.
+The server receives `approval` as a typed RPC client and calls `yield* approval.approve(...)`. The browser retains the dialog implementation and UI services; only an opaque reference and schema-encoded calls cross the connection.
 
-Streaming capability methods are not supported; use a normal streaming RPC for server push. Reconnection does not replay mutations, recreate capabilities, or resubscribe streams. Applications should explicitly re-authenticate and resubscribe.
+Callbacks become more valuable when a workflow needs several interactions. For example, a file import can report meaningful milestones and ask a question only when necessary:
+
+```ts
+const ImportUiRpcs = RpcGroup.make(
+  Rpc.make("progress", {
+    payload: {
+      completed: Schema.Number,
+      total: Schema.Number,
+      message: Schema.String
+    },
+    success: Schema.Void
+  }),
+  Rpc.make("confirmOverwrite", {
+    payload: { path: Schema.String },
+    success: Schema.Boolean,
+    error: DialogUnavailable
+  })
+)
+
+const ImportUi = Capability.make("imports/Ui", ImportUiRpcs)
+
+const ImportRpcs = RpcGroup.make(
+  Rpc.make("importArchive", {
+    payload: {
+      archiveId: Schema.String,
+      ui: ImportUi.schema
+    },
+    success: ImportSummary,
+    error: Schema.Union([
+      ImportFailed,
+      DialogUnavailable,
+      Capability.CapabilityUnavailable,
+      Capability.CapabilityTransportError
+    ])
+  })
+)
+```
+
+The server can express the workflow directly with `Effect.gen`:
+
+```ts
+const ImportHandlers = ImportRpcs.of({
+  importArchive: ({ archiveId, ui }) => Effect.gen(function*() {
+    const entries = yield* Archives.entries(archiveId)
+
+    for (const [index, entry] of entries.entries()) {
+      if (yield* Files.exists(entry.path)) {
+        const overwrite = yield* ui.confirmOverwrite({ path: entry.path })
+        if (!overwrite) continue
+      }
+
+      yield* Files.write(entry)
+      yield* ui.progress({
+        completed: index + 1,
+        total: entries.length,
+        message: `Imported ${entry.path}`
+      })
+    }
+
+    return new ImportSummary({ imported: entries.length })
+  })
+})
+```
+
+The client supplies behavior using the same Effect-native handler API:
+
+```ts
+const ui = yield* ImportUi.fromHandlers({
+  progress: ({ completed, total, message }) =>
+    ImportScreen.update({ completed, total, message }),
+  confirmOverwrite: ({ path }) =>
+    Dialog.confirm(`Replace ${path}?`)
+})
+
+const summary = yield* rpc.importArchive({ archiveId, ui })
+```
+
+Without a callback capability, this often becomes an operation ID plus progress polling, a server-side table of pending questions, and separate answer endpoints. The capability keeps the control flow in one readable Effect while preserving typed payloads, errors, cancellation, and connection scope.
+
+Other useful callback capabilities include:
+
+- requesting a signature while a private key stays on the client;
+- resolving an application-specific conflict during synchronization;
+- asking a worker for credentials only when an upstream service challenges; and
+- supplying a test implementation that deterministically drives an interactive server workflow.
+
+Calls in either direction can run concurrently, typed failures travel in either direction, and interruption of a server wait interrupts the in-flight client handler. Capability handlers can use client-side Effect services just as server capabilities capture server-side services.
+
+Use a normal streaming RPC when the server only needs to publish a sequence of values. Use a callback capability when the server needs to invoke named client behavior, receive a typed response, or expose several related operations. Streaming capability methods themselves are not supported.
+
+### Operational boundaries
+
+Capabilities are intentionally connection-scoped rather than durable identities:
+
+- reconnection does not replay mutations, recreate capabilities, or resubscribe streams; applications should explicitly re-authenticate and resubscribe;
+- releasing a remote capability makes later calls fail with `CapabilityUnavailable`;
+- disconnects and reverse-call transport failures are represented by `CapabilityTransportError`; and
+- reverse capability calls are rejected while an atomic execution region such as a SQL transaction is active, preventing the server from holding locks while it waits for a browser or another peer. Commit first, then perform the interactive callback in a separate phase.
 
 ## Errors and requirements
 
@@ -489,13 +665,14 @@ const invoices = rpc.listInvoices({ accountId: account.id })
 
 // Effect<ReadonlyArray<Invoice>,
 //   AccountNotFound | InvoiceError | Unauthorized |
-//   RpcClientError | PipelineProtocolError,
+//   RpcClientError | PipelineProtocolError | PipelineExecutionError,
 //   ClientSchemaServices>
 ```
 
 - Domain and middleware errors remain schema-backed tagged errors, so `Effect.catchTag` and `Effect.catchTags` work normally.
 - Transport failures use Effect's `RpcClientError`.
 - Invalid or incompatible request graphs fail with `PipelineProtocolError`.
+- Server infrastructure failures use the stable `PipelineExecutionError` instead of exposing driver-specific details.
 - Client schema services and required client middleware remain visible in the Effect requirement type.
 - Services needed only by handlers or server middleware stay on the server.
 
@@ -583,33 +760,108 @@ Mutations should invalidate affected entries before a later query phase. Batchin
 
 ## Transactions
 
-`aroundExecution` wraps the entire graph before failures are converted into transport responses. The included `PipelineServer.sqlTransaction` runs mutations and client-selected follow-up queries on the same Effect SQL transaction:
+Add the SQL integration to the server's `middleware` array to run every valid pipeline in one Effect SQL transaction:
 
 ```ts
+import * as PipelineSql from "effect-rpc-pipeline/Sql"
+
 const RpcRoutes = PipelineServer.layerHttp({
   group: AppRpcs,
   path: "/rpc",
-  aroundExecution: PipelineServer.sqlTransaction
+  middleware: [PipelineSql.transaction()]
 }).pipe(
   Layer.provide(AppLive),
   Layer.provide(SqlLive)
 )
 ```
 
-Successful pipelines commit once. Typed failures, defects, and interruption reach `sql.withTransaction` and roll back normally. Nested Effect SQL transactions retain their normal savepoint behavior.
+The integration wraps validated execution with Effect's `sql.withTransaction`. Successful pipelines commit once. Typed failures, defects, and interruption roll back normally, and nested Effect SQL transactions retain their normal savepoint behavior. Invalid graphs are rejected before a connection or transaction is acquired.
 
-`aroundExecution` is generic and can also implement tracing, metrics, or an application-specific transaction policy:
+By default every pipeline on the route is transactional. A server can select pipelines when needed:
 
 ```ts
-aroundExecution: (execution, { request, metadata }) =>
-  Effect.annotateLogs(
-    execution,
-    "pipeline.requestId",
-    String(metadata.requestId)
-  )
+middleware: [
+  PipelineSql.transaction({
+    when: ({ rpcTags }) => rpcTags.some((tag) =>
+      tag === "createTodo" || tag === "updateTodo" || tag === "deleteTodo"
+    )
+  })
+]
 ```
 
-Wrapping every graph in a transaction is not always appropriate, especially when handlers perform slow external calls. Transaction policy remains server-controlled. Reverse capability calls are rejected while `sqlTransaction` is active so the server cannot hold SQL locks while waiting for a browser or another peer.
+Do not infer mutation behavior from naming conventions in library code. For applications with dynamic capability calls or mixed workloads, use an unconditional pipeline transaction or call `sql.withTransaction` explicitly in the relevant handler.
+
+Reverse capability calls are rejected while the transaction is active, so SQL locks cannot be held while waiting for a remote peer. Complete the transaction before starting an interactive callback workflow.
+
+## Tracing and metrics
+
+`PipelineTelemetry.make()` adds native Effect tracing and low-cardinality metrics:
+
+```ts
+import * as PipelineTelemetry from "effect-rpc-pipeline/Telemetry"
+
+const RpcRoutes = PipelineServer.layerHttp({
+  group: AppRpcs,
+  path: "/rpc",
+  middleware: [PipelineTelemetry.make()]
+}).pipe(Layer.provide(AppLive))
+```
+
+The default integration creates a semantic span for the complete pipeline, child spans for actual root and capability RPC invocations, and metrics for request count, duration, node count, invocation count, invocation duration, and outcomes.
+
+It uses Effect's native tracer and metric registry. Applications that provide an Effect OpenTelemetry layer get exported pipeline telemetry without a pipeline-specific exporter or OTLP configuration.
+
+Tracing and metrics can be configured independently:
+
+```ts
+const telemetry = PipelineTelemetry.make({
+  tracing: {
+    spanPrefix: "TodoPipeline",
+    invocations: true
+  },
+  metrics: {
+    prefix: "todo_rpc"
+  }
+})
+```
+
+Set either option to `false` to disable it. Payloads, headers, user IDs, request IDs, client IDs, and capability IDs are not included in telemetry by default.
+
+SQL and telemetry use the same simple server surface:
+
+```ts
+middleware: [
+  PipelineTelemetry.make(),
+  PipelineSql.transaction()
+]
+```
+
+## Advanced server middleware
+
+Most applications should use the supplied SQL and telemetry integrations. `PipelineServer.makeMiddleware` is the escape hatch for logging, resource leasing, timeouts, auditing, or another application-specific concern:
+
+```ts
+const AuditMiddleware = PipelineServer.makeMiddleware({
+  request: (effect, { request, metadata }) =>
+    Effect.annotateLogs(effect, {
+      pipeline: request.definitionId,
+      requestId: String(metadata.requestId)
+    }),
+  invocation: (effect, { rpc, kind }) =>
+    Effect.annotateLogs(effect, {
+      rpc: rpc._tag,
+      kind
+    })
+})
+
+const RpcRoutes = PipelineServer.layerHttp({
+  group: AppRpcs,
+  path: "/rpc",
+  middleware: [AuditMiddleware]
+})
+```
+
+The optional `request`, `execution`, and `invocation` hooks wrap the entire decoded request, validated graph execution, and each actual handler invocation respectively. They are ordinary Effect transformations, so requirements and errors compose normally. Middleware is applied from first to last, with the first entry outermost when several entries use the same hook.
 
 ## Custom transports and direct execution
 
@@ -648,6 +900,7 @@ This path is useful for unit tests and framework adapters. Native streaming and 
 
 - standard Effect RPC schemas and handlers;
 - mutation-plus-query responses;
+- native Effect tracing and metrics through the server middleware integration;
 - HTTP and WebSocket servers on one route;
 - a live update stream; and
 - end-to-end tests for the full TodoMVC workflow.

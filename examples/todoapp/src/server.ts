@@ -1,6 +1,7 @@
 import * as Effect from "effect/Effect"
 import * as Layer from "effect/Layer"
 import * as PipelineServer from "effect-rpc-pipeline/PipelineServer"
+import * as PipelineTelemetry from "effect-rpc-pipeline/Telemetry"
 import { AppRpcs, AuthedCapability, User } from "./schema.js"
 
 const users = new Map([
@@ -46,18 +47,21 @@ export const AppHandlers = AppRpcs.of({
 })
 
 export const AppLive = AppRpcs.toLayer(AppHandlers)
+const ServerTelemetry = PipelineTelemetry.make({ metrics: { prefix: "example_app_rpc" } })
 
 // Native Effect composition for a real RpcServer host. Existing AppLive is reused unchanged.
 export const ServerLive = PipelineServer.layerHttp({
   group: AppRpcs,
   id: "example-app",
-  path: "/rpc"
+  path: "/rpc",
+  middleware: [ServerTelemetry]
 }).pipe(Layer.provide(AppLive))
 
 export const WebSocketServerLive = PipelineServer.layerWebSocket({
   group: AppRpcs,
   id: "example-app",
-  path: "/rpc"
+  path: "/rpc",
+  middleware: [ServerTelemetry]
 }).pipe(Layer.provide(AppLive))
 
 export const handlePipeline = async (request: unknown) => {

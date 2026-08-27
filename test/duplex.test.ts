@@ -5,9 +5,11 @@ import * as Schema from "effect/Schema"
 import * as Rpc from "effect/unstable/rpc/Rpc"
 import * as RpcGroup from "effect/unstable/rpc/RpcGroup"
 import * as RpcTest from "effect/unstable/rpc/RpcTest"
+import * as SqlClient from "effect/unstable/sql/SqlClient"
 import { describe, expect, expectTypeOf, it } from "vitest"
 import * as Capability from "../src/Capability.js"
 import * as Duplex from "../src/Duplex.js"
+import * as PipelineSql from "../src/Sql.js"
 
 describe("bidirectional capability sessions", () => {
   it("lets the server invoke a typed capability exported by the client", async () => {
@@ -35,9 +37,12 @@ describe("bidirectional capability sessions", () => {
       const remote = Duplex.resolveServerValue(server, 0, ref) as typeof local
       const accepted = yield* remote.approve({ total: 42 })
       const rejected = yield* remote.approve({ total: 142 })
-      const transactionFailure = yield* Effect.flip(remote.approve({ total: 1 }).pipe(
-        Effect.provideService(Duplex.InTransaction, true)
-      ))
+      const sql = { withTransaction: <A, E, R>(effect: Effect.Effect<A, E, R>) => effect } as SqlClient.SqlClient
+      const transaction = PipelineSql.transaction().execution!
+      const transactionFailure = yield* Effect.flip(transaction(
+        remote.approve({ total: 1 }),
+        {} as any
+      ).pipe(Effect.provideService(SqlClient.SqlClient, sql)))
 
       expectTypeOf(remote.approve({ total: 1 })).toMatchTypeOf<Effect.Effect<boolean, ApprovalFailed | Capability.CapabilityUnavailable | Capability.CapabilityTransportError>>()
       return { accepted, rejected, transactionFailure }

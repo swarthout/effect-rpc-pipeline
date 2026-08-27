@@ -22,6 +22,13 @@ export class PipelineProtocolError extends Schema.TaggedError<PipelineProtocolEr
   constructor(message: string, code = "InvalidPipeline") { super({ message, code }) }
 }
 
+/** A safe, transportable failure raised by server execution infrastructure. */
+export class PipelineExecutionError extends Schema.TaggedError<PipelineExecutionError>()("PipelineExecutionError", {
+  message: Schema.String,
+  code: Schema.String,
+  retryable: Schema.Boolean
+}) {}
+
 export type Expr =
   | { readonly _tag: "literal"; readonly value?: unknown }
   | { readonly _tag: "ref"; readonly id: string; readonly path: ReadonlyArray<string | number> }
@@ -72,7 +79,7 @@ type ClientMethod<R extends Rpc.Any, E, Env> = Rpc.Success<R> extends Stream.Str
   ? RpcClient.RpcClient<R, E>[R["_tag"]]
   : PipelineMethod<R, E, Env>
 
-export type ClientApi<Rpcs extends Rpc.Any, E = RpcClientError | PipelineProtocolError, Env = never> = {
+export type ClientApi<Rpcs extends Rpc.Any, E = RpcClientError | PipelineProtocolError | PipelineExecutionError, Env = never> = {
   readonly [R in Rpcs as R["_tag"]]: ClientMethod<R, E, Env>
 }
 export type PipelineInput<A> = A | Remote<A, any, any> | (A extends ReadonlyArray<infer I> ? ReadonlyArray<PipelineInput<I>> : A extends Option.Option<infer I> ? Option.Option<PipelineInput<I>> : A extends object ? { readonly [K in keyof A]: PipelineInput<A[K]> } : never)

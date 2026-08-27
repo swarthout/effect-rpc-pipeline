@@ -13,16 +13,12 @@ import * as RpcClient from "effect/unstable/rpc/RpcClient"
 import * as RpcGroup from "effect/unstable/rpc/RpcGroup"
 import type { CapabilityInstance, CapabilityRef } from "./Capability.js"
 import * as Capability from "./Capability.js"
+import { PeerCalls } from "./ExecutionPolicy.js"
 
 export class DuplexError extends Schema.TaggedError<DuplexError>()("DuplexError", {
   reason: Schema.String,
   sessionId: Schema.optional(Schema.String),
   capabilityId: Schema.optional(Schema.String)
-}) {}
-
-/** Marks execution that must not wait for a remote peer while holding resources such as SQL locks. */
-export class InTransaction extends Context.Reference<boolean>("effect-rpc-pipeline/DuplexInTransaction", {
-  defaultValue: () => false
 }) {}
 
 export const CapabilityRefSchema: Schema.Schema<CapabilityRef> = Schema.Struct({
@@ -148,9 +144,10 @@ export const makeServer = Effect.sync((): ServerService => {
       return Effect.void
     }),
     invokeClient: (clientId, ref, method, payload) => Effect.gen(function*() {
-      if (yield* InTransaction) {
+      const peerCalls = yield* PeerCalls
+      if (peerCalls._tag === "Denied") {
         return yield* Effect.fail(new Capability.CapabilityTransportError({
-          reason: "A reverse RPC cannot run inside sqlTransaction; publish after commit or opt into a separate workflow",
+          reason: peerCalls.reason,
           capabilityId: ref.capabilityId
         }))
       }
