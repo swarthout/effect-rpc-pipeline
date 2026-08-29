@@ -1,9 +1,10 @@
 import { Option } from "effect"
 import { type Update } from "foldkit"
 import { evo } from "foldkit/struct"
+import { type BlogClient } from "../client/blog-client.js"
 import {
   AddComment, DeleteComment, LoadAdmin, LoadFeed, LoadPost, Login, ModerateComment, ModeratePost,
-  Register, SavePost, SetRole, SetSuspended, ToggleUpvote
+  Logout, Register, SavePost, SetRole, SetSuspended, ToggleUpvote
 } from "./commands.js"
 import { type Model } from "./model.js"
 import { Message, type Message as MessageType } from "./message.js"
@@ -17,7 +18,7 @@ const admin = (model: Model, make: (accessToken: string) => any) => Option.match
   onSome: ({ accessToken }) => ({ model, commands: [make(accessToken)] })
 })
 
-export const update = (model: Model, message: MessageType) => Message.match<Update.Return<Model, MessageType>>(message, {
+export const update = (model: Model, message: MessageType) => Message.match<Update.Return<Model, MessageType, BlogClient>>(message, {
   ClickedFeed: () => ({ model: evo(model, { page: () => "Feed", loadState: () => "Loading", error: () => "" }), commands: [LoadFeed({ search: model.search })] }),
   ClickedLogin: () => ({ model: evo(model, { page: () => "Login", error: () => "" }) }),
   ClickedRegister: () => ({ model: evo(model, { page: () => "Register", error: () => "" }) }),
@@ -29,7 +30,7 @@ export const update = (model: Model, message: MessageType) => Message.match<Upda
     })
   }),
   ClickedAdmin: () => admin(model, (accessToken) => LoadAdmin({ accessToken })),
-  ClickedLogout: () => ({ model: evo(model, { maybeSession: () => Option.none(), maybePost: () => Option.none(), page: () => "Feed" }) }),
+  ClickedLogout: () => ({ model: evo(model, { maybeSession: () => Option.none(), maybePost: () => Option.none(), page: () => "Feed" }), commands: [Logout()] }),
   ClickedPost: ({ slug }) => ({ model: evo(model, { page: () => "Post", maybePost: () => Option.none(), loadState: () => "Loading", error: () => "" }), commands: [LoadPost({ slug, maybeAccessToken: token(model) })] }),
   ChangedSearch: ({ value }) => ({ model: evo(model, { search: () => value }) }), ChangedUsername: ({ value }) => ({ model: evo(model, { username: () => value }) }),
   ChangedDisplayName: ({ value }) => ({ model: evo(model, { displayName: () => value }) }), ChangedPassword: ({ value }) => ({ model: evo(model, { password: () => value }) }),
@@ -50,6 +51,8 @@ export const update = (model: Model, message: MessageType) => Message.match<Upda
   SucceededLoadFeed: ({ posts }) => ({ model: evo(model, { feed: () => posts, loadState: () => "Ready" }) }),
   SucceededLoadPost: ({ post }) => ({ model: evo(model, { maybePost: () => Option.some(post), loadState: () => "Ready" }) }),
   SucceededLogin: ({ session }) => ({ model: evo(model, { maybeSession: () => Option.some(session), page: () => "Feed", password: () => "", loadState: () => "Loading" }), commands: [LoadFeed({ search: model.search })] }),
+  CompletedRestoreSession: ({ maybeSession }) => ({ model: evo(model, { maybeSession: () => maybeSession }) }),
+  CompletedLogout: () => ({ model }),
   SucceededSavePost: () => ({ model: evo(model, { page: () => "Feed", editingPostId: () => Option.none(), title: () => "", excerpt: () => "", body: () => "", tags: () => "", loadState: () => "Loading" }), commands: [LoadFeed({ search: "" })] }),
   SucceededAddComment: () => ({ model: evo(model, { commentBody: () => "" }), commands: reloadPost(model) }),
   SucceededToggleUpvote: () => ({ model, commands: reloadPost(model) }), SucceededDeleteComment: () => ({ model, commands: reloadPost(model) }),

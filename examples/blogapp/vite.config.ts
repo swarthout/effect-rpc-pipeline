@@ -7,7 +7,7 @@ export default defineConfig({
     port: 5174,
     proxy: {
       "/rpc": "http://127.0.0.1:8788",
-      "/auth": "http://127.0.0.1:8788"
+      "/session": "http://127.0.0.1:8788"
     }
   }
 })

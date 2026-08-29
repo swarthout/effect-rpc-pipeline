@@ -130,29 +130,35 @@ The optional `id` identifies the pipeline definition. Use the same value when co
 
 ## Create an HTTP client
 
-`PipelineClient.make` derives its fully typed client from the same group:
+Define the generated client as an Effect service, then provide the HTTP implementation as a Layer. The service is inferred from the same RPC group, so it stays in sync with the contract:
 
 ```ts
+import * as Context from "effect/Context"
 import * as Effect from "effect/Effect"
+import * as Layer from "effect/Layer"
 import * as RpcSerialization from "effect/unstable/rpc/RpcSerialization"
 import * as PipelineClient from "effect-rpc-pipeline/PipelineClient"
 
-const program = Effect.scoped(Effect.gen(function*() {
-  const rpc = yield* PipelineClient.make(AppRpcs, { id: "app" })
+class AppClient extends Context.Service<
+  AppClient,
+  PipelineClient.Client<typeof AppRpcs>
+>()("app/AppClient") {}
 
+const AppClientHttp = PipelineClient.layerClientHttp(AppClient, AppRpcs, {
+  url: "http://127.0.0.1:8787/rpc",
+  id: "app"
+}).pipe(Layer.provide(RpcSerialization.layerJson))
+
+const program = Effect.gen(function*() {
+  const rpc = yield* AppClient
   // Running a single remote value sends one request.
   return yield* rpc.findUser({ email: "ada@example.com" })
-})).pipe(
-  Effect.provide(PipelineClient.layerHttp({
-    url: "http://127.0.0.1:8787/rpc"
-  })),
-  Effect.provide(RpcSerialization.layerJson)
-)
+}).pipe(Effect.provide(AppClientHttp))
 ```
 
-Keep the transport layer around both client construction and client use. Native Effect transports and WebSocket connections are scoped resources.
+The HTTP facade is reusable and does not require `Scope`. Each finite pipeline execution, including an entire dependency graph, opens and closes one internal Effect RPC scope. This makes a client Layer safe to keep for the application lifetime without constructing a client for every call. Use the scoped WebSocket client for streams and connection-scoped capabilities.
 
-`layerHttp` combines Effect's HTTP RPC protocol with `FetchHttpClient`. Applications that already provide their own Effect HTTP client can use `PipelineClient.layerProtocolHttp` instead.
+For a local tool or test that does not need a service, `PipelineClient.makeHttp(AppRpcs, options)` returns the same resource-safe facade directly. The lower-level `PipelineClient.make` and protocol Layers remain available for custom transports and explicit resource control.
 
 ## Compose finite calls
 
@@ -302,6 +308,39 @@ const PrivateRoutes = PipelineServer.layerHttp({
 )
 ```
 
+For a mixed public and protected group, provide the required client middleware once and read the current token for every pipeline execution:
+
+```ts
+import * as Option from "effect/Option"
+
+class CurrentAccessToken extends Context.Reference<
+  Option.Option<Redacted.Redacted<string>>
+>("app/CurrentAccessToken", { defaultValue: Option.none }) {}
+
+const AuthenticatedClient = Auth.layerClientBearer(Authenticated, {
+  token: CurrentAccessToken
+})
+
+const ClientLive = PipelineClient.layerClientHttp(AppClient, AppRpcs, {
+  url: "/rpc"
+}).pipe(
+  Layer.provide(AuthenticatedClient),
+  Layer.provide(RpcSerialization.layerJson)
+)
+
+const privateProgram = Effect.gen(function*() {
+  const rpc = yield* AppClient
+  return yield* rpc.me().pipe(
+    Effect.provideService(
+      CurrentAccessToken,
+      Option.some(Redacted.make(accessToken))
+    )
+  )
+}).pipe(Effect.provide(ClientLive))
+```
+
+`None` sends no authorization header, so public RPCs work anonymously. A refreshed token is observed without rebuilding the client. This is only credential propagation: protected server middleware still authenticates every invocation.
+
 `Auth.layerBearer` does not verify JWTs itself. Implement `AccessTokenVerifier` with a maintained JOSE/OIDC library and pin the allowed algorithm, issuer, audience, token type, expiration, and required claims. Send bearer credentials only in the `Authorization` header over TLS; never put them in pipeline payloads or URLs. `Redacted` reduces accidental disclosure in logs but is not encryption.
 
 Keep public and protected surfaces explicit, and optionally assert that no RPC was exposed accidentally:
@@ -361,27 +400,36 @@ const TodoHandlers = TodoRpcs.toLayer({
 })
 ```
 
-The pipeline client exposes finite methods as `Remote` Effects and streaming methods as native Effect `Stream` values:
+The pipeline client exposes finite methods as `Remote` Effects and streaming methods as native Effect `Stream` values. A WebSocket client is a real scoped resource, so its service Layer is the natural owner of the connection:
 
 ```ts
 import * as Socket from "effect/unstable/socket/Socket"
 
-const program = Effect.scoped(Effect.gen(function*() {
-  const rpc = yield* PipelineClient.make(TodoRpcs)
+class TodoClient extends Context.Service<
+  TodoClient,
+  PipelineClient.Client<typeof TodoRpcs>
+>()("app/TodoClient") {}
 
+const TodoClientWebSocket = PipelineClient.layerClientWebSocket(
+  TodoClient,
+  TodoRpcs,
+  { url: "ws://127.0.0.1:8787/rpc" }
+).pipe(
+  Layer.provide(RpcSerialization.layerJson),
+  Layer.provide(Socket.layerWebSocketConstructorGlobal)
+)
+
+const program = Effect.gen(function*() {
+  const rpc = yield* TodoClient
   yield* rpc.watchTodos().pipe(
     Stream.runForEach((event) => Effect.log("todo update", event))
   )
-})).pipe(
-  Effect.provide(PipelineClient.layerWebSocket({
-    url: "ws://127.0.0.1:8787/rpc"
-  })),
-  Effect.provide(RpcSerialization.layerJson),
-  Effect.provide(Socket.layerWebSocketConstructorGlobal)
-)
+}).pipe(Effect.provide(TodoClientWebSocket))
 ```
 
-`layerWebSocket` uses Effect's socket RPC transport, including multiplexing, acknowledgements, interruption, ping/pong, and reconnect policy hooks. Use `layerProtocolWebSocket` when supplying an Effect `Socket` yourself.
+The Layer opens one connection when acquired, shares it across calls, streams, and connection-scoped capabilities, and closes it when the Layer scope ends. At an application boundary that means one application connection. Providing the Layer inside `Effect.scoped` gives a shorter connection lifetime. `PipelineClient.makeWebSocket` exposes the same scoped constructor when explicit ownership is useful.
+
+The lower-level `layerWebSocket` supplies Effect's protocol and uses Effect's socket RPC transport, including multiplexing, acknowledgements, interruption, ping/pong, and reconnect policy hooks. Use `layerProtocolWebSocket` when supplying an Effect `Socket` yourself.
 
 Streams have an independent, backpressured lifetime and cannot be embedded in finite `Pipeline.all`, `Pipeline.map`, or `Pipeline.andThen` graphs.
 
@@ -825,6 +873,26 @@ Do not infer mutation behavior from naming conventions in library code. For appl
 
 Reverse capability calls are rejected while the transaction is active, so SQL locks cannot be held while waiting for a remote peer. Complete the transaction before starting an interactive callback workflow.
 
+### Run effects after a successful commit
+
+Register best-effort follow-up work from a transactional handler with `PipelineSql.afterCommit`:
+
+```ts
+createPost: (input) => Effect.gen(function*() {
+  const post = yield* Posts.create(input)
+
+  yield* PipelineSql.afterCommit(
+    PostEvents.publish({ _tag: "PostCreated", postId: post.id })
+  )
+
+  return post
+})
+```
+
+Registered effects run sequentially after the outer pipeline transaction commits. They are discarded on rollback and run with the pipeline's outer service context, after the transaction connection has been released. Materialize invocation-local values such as `CurrentUser` before registering the effect. A post-commit failure is logged by default and cannot turn an already committed mutation into a reported rollback; customize reporting with `onAfterCommitFailure`.
+
+This hook is appropriate for in-process notifications, cache invalidation, and best-effort telemetry that must not run before commit. It is not a durable delivery mechanism. Use a transactional outbox when work must survive a process crash or be retried reliably.
+
 ## Tracing and metrics
 
 `PipelineTelemetry.make()` adds native Effect tracing and low-cardinality metrics:
@@ -897,7 +965,27 @@ The optional `request`, `execution`, and `invocation` hooks wrap the entire deco
 
 ## Custom transports and direct execution
 
-Most applications should use the native HTTP or WebSocket layers. Tests and embedded environments can provide a `PipelineTransport` directly:
+Most applications should use the native HTTP or WebSocket client Layers. SSR, tests, workers, and embedded environments can run the same server path without serialization or network I/O:
+
+```ts
+const AppClientInProcess = PipelineClient.layerClientInProcess(
+  AppClient,
+  AppRpcs,
+  {
+    id: "app",
+    middleware: [PipelineTelemetry.make(), PipelineSql.transaction()]
+  }
+).pipe(Layer.provide(AppLive))
+
+const flags = Effect.gen(function*() {
+  const rpc = yield* AppClient
+  return { posts: yield* rpc.listPosts({ limit: 20 }) }
+}).pipe(Effect.provide(AppClientInProcess))
+```
+
+The in-process client uses normal graph validation, middleware, authentication headers, limits, handlers, batching, and transactions. It is not a handler shortcut. Native streams and connection-scoped capabilities still require WebSocket.
+
+Framework adapters can also provide a `PipelineTransport` directly:
 
 ```ts
 const rpc = yield* PipelineClient.make(AppRpcs, {
@@ -960,6 +1048,6 @@ See [`examples/todoapp/README.md`](./examples/todoapp/README.md) for commands an
 
 ## Full-stack blog example
 
-[`examples/blogapp`](./examples/blogapp) is a production-shaped Effect, Node.js, SQLite, JWT, and Foldkit application. It covers public reading, registration, post authoring and editing, comments, upvotes, administration, refresh-token rotation, request batching, SQL transactions, telemetry, HTTP and WebSocket transports, streams, server capabilities, and client callbacks.
+[`examples/blogapp`](./examples/blogapp) is a production-shaped Effect, Node.js, SQLite, JWT, and Foldkit application. It covers public reading, registration, post authoring and editing, comments, upvotes, administration, secure cookie refresh sessions, request batching, SQL transactions and post-commit events, telemetry, HTTP and WebSocket client Layers, SSR through an in-process pipeline client, streams, server capabilities, and client callbacks.
 
 See [`examples/blogapp/README.md`](./examples/blogapp/README.md) for the architecture, setup, pipeline patterns, security model, and test coverage. Package issues discovered through the example are tracked in [`examples/blogapp/PACKAGE_AUDIT.md`](./examples/blogapp/PACKAGE_AUDIT.md).

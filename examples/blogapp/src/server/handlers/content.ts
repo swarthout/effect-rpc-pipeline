@@ -1,4 +1,5 @@
 import * as Effect from "effect/Effect"
+import * as PipelineSql from "effect-rpc-pipeline/Sql"
 import {
   AuthorSession, CurrentUser, Forbidden, NotificationSink, type PostStatus, type Principal
 } from "../../shared/contracts.js"
@@ -22,36 +23,36 @@ export const makeContentHandlers = Effect.fn("makeContentHandlers")(function*(ev
     createPost: (input: PostInput) => Effect.gen(function*() {
       const principal = yield* CurrentUser; yield* requireScope(principal, "posts:write", "create post")
       const post = yield* database.createPost(principal.id, input)
-      yield* events.publish("PostChanged", post.id, `${principal.username} created ${post.title}`)
+      yield* PipelineSql.afterCommit(events.publish("PostChanged", post.id, `${principal.username} created ${post.title}`))
       return post
     }),
     updatePost: ({ id, ...input }: PostInput & { readonly id: string }) => Effect.gen(function*() {
       const principal = yield* CurrentUser; yield* requireScope(principal, "posts:write", "update post"); yield* canManagePost(principal, id)
       const post = yield* database.updatePost(id, input)
-      yield* events.publish("PostChanged", post.id, `${principal.username} updated ${post.title}`)
+      yield* PipelineSql.afterCommit(events.publish("PostChanged", post.id, `${principal.username} updated ${post.title}`))
       return post
     }),
     deletePost: ({ id }: { id: string }) => Effect.gen(function*() {
       const principal = yield* CurrentUser; yield* canManagePost(principal, id)
-      const removed = yield* database.deletePost(id); yield* events.publish("Moderated", id, `${principal.username} deleted a post`)
+      const removed = yield* database.deletePost(id); yield* PipelineSql.afterCommit(events.publish("Moderated", id, `${principal.username} deleted a post`))
       return removed
     }),
     addComment: ({ postId, body }: { postId: string; body: string }) => Effect.gen(function*() {
       const principal = yield* CurrentUser; yield* requireScope(principal, "comments:write", "comment")
       const comment = yield* database.createComment(postId, principal.id, body)
-      yield* events.publish("CommentAdded", postId, `${principal.username} commented`)
+      yield* PipelineSql.afterCommit(events.publish("CommentAdded", postId, `${principal.username} commented`))
       return comment
     }),
     deleteComment: ({ id }: { id: string }) => Effect.gen(function*() {
       const principal = yield* CurrentUser; const comment = yield* database.getComment(id)
       if (comment.authorId !== principal.id && principal.role !== "Admin") return yield* new Forbidden({ action: "delete comment" })
-      const removed = yield* database.deleteComment(id); yield* events.publish("CommentDeleted", comment.postId, `${principal.username} deleted a comment`)
+      const removed = yield* database.deleteComment(id); yield* PipelineSql.afterCommit(events.publish("CommentDeleted", comment.postId, `${principal.username} deleted a comment`))
       return removed
     }),
     toggleUpvote: ({ postId }: { postId: string }) => Effect.gen(function*() {
       const principal = yield* CurrentUser; yield* requireScope(principal, "votes:write", "upvote")
       const upvoted = yield* database.toggleVote(postId, principal.id)
-      yield* events.publish("VoteChanged", postId, `${principal.username} ${upvoted ? "upvoted" : "removed an upvote"}`)
+      yield* PipelineSql.afterCommit(events.publish("VoteChanged", postId, `${principal.username} ${upvoted ? "upvoted" : "removed an upvote"}`))
       return upvoted
     }),
     hasUpvoted: ({ postId }: { postId: string }) => Effect.flatMap(CurrentUser, (principal) => database.hasUpvoted(postId, principal.id)),

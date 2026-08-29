@@ -35,6 +35,7 @@ export class BlogDatabase extends Context.Service<BlogDatabase, {
   readonly updateUser: (id: string, fields: { readonly role?: Role; readonly isSuspended?: boolean }) => Effect.Effect<User, NotFound>
   readonly saveRefreshToken: (input: { readonly digest: string; readonly family: string; readonly userId: string; readonly expiresAt: number }) => Effect.Effect<void>
   readonly rotateRefreshToken: (oldDigest: string, next: { readonly digest: string; readonly family: string; readonly userId: string; readonly expiresAt: number }) => Effect.Effect<void, NotFound>
+  readonly revokeRefreshToken: (digest: string) => Effect.Effect<void>
   readonly createPost: (authorId: string, input: { readonly title: string; readonly excerpt: string; readonly body: string; readonly tags: ReadonlyArray<string>; readonly status: PostStatus }) => Effect.Effect<Post, InvalidInput | Conflict>
   readonly updatePost: (id: string, input: { readonly title: string; readonly excerpt: string; readonly body: string; readonly tags: ReadonlyArray<string>; readonly status: PostStatus }) => Effect.Effect<Post, InvalidInput | NotFound>
   readonly getPostById: (id: string) => Effect.Effect<Post, NotFound>
@@ -172,6 +173,7 @@ export const BlogDatabaseLive = Layer.effect(BlogDatabase, Effect.gen(function*(
       yield* query`INSERT INTO refresh_tokens (digest, family, user_id, expires_at) VALUES (${next.digest}, ${next.family}, ${next.userId}, ${next.expiresAt})`
       return undefined
     }),
+    revokeRefreshToken: (digest) => query`UPDATE refresh_tokens SET used_at = ${Date.now()} WHERE digest = ${digest} AND used_at IS NULL`.pipe(Effect.asVoid, Effect.orDie),
     createPost,
     updatePost,
     getPostById,

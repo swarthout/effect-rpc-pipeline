@@ -1,6 +1,6 @@
 import { Schema as S } from "effect"
 import { defineMessageUnion } from "foldkit/message"
-import { AdminSummary, AuthTokens, PostCard, PostDetails } from "../shared/contracts.js"
+import { AdminSummary, BrowserSession, PostCard, PostDetails } from "../shared/contracts.js"
 
 export const Message = defineMessageUnion({
   ClickedFeed: {}, ClickedLogin: {}, ClickedRegister: {}, ClickedEditor: {}, ClickedAdmin: {}, ClickedLogout: {},
@@ -16,7 +16,7 @@ export const Message = defineMessageUnion({
   ClickedModeratePost: { id: S.String, status: S.Literals(["Draft", "Published"]) },
   ClickedModerateComment: { id: S.String },
   SucceededLoadFeed: { posts: S.Array(PostCard) }, SucceededLoadPost: { post: PostDetails },
-  SucceededLogin: { session: AuthTokens }, SucceededSavePost: {}, SucceededAddComment: {},
+  SucceededLogin: { session: BrowserSession }, CompletedRestoreSession: { maybeSession: S.Option(BrowserSession) }, CompletedLogout: {}, SucceededSavePost: {}, SucceededAddComment: {},
   SucceededToggleUpvote: {}, SucceededDeleteComment: {},
   SucceededLoadAdmin: { summary: AdminSummary }, SucceededUpdateAdmin: { summary: AdminSummary },
   FailedRequest: { error: S.String }

@@ -110,13 +110,33 @@ describe("authentication primitives", () => {
       const invalid = yield* Effect.flip(client.me().pipe(RpcClient.withHeaders({ authorization: "Bearer invalid.jwt.value" })))
       const mixed = yield* Effect.flip(Pipeline.all({ health: client.health(), me: client.me() }))
       const health = yield* client.health()
-      return { authenticated, missing, invalid, mixed, health }
+      let currentToken = Option.none<string>()
+      const DynamicClientAuth = Auth.layerClientBearer(Authenticated, {
+        token: Effect.sync(() => currentToken)
+      })
+      const dynamic = yield* PipelineClient.make(App, {
+        transport: (request, options) => PipelineServer.handle(App, request, {
+          metadata: {
+            client: new Rpc.ServerClient(2),
+            requestId: "dynamic-jwt-test",
+            headers: options?.headers ?? Headers.empty
+          }
+        }).pipe(Effect.provideContext(context))
+      }).pipe(Effect.provide(DynamicClientAuth))
+      const dynamicHealth = yield* dynamic.health()
+      const dynamicMissing = yield* Effect.flip(dynamic.me())
+      currentToken = Option.some(token)
+      const dynamicAuthenticated = yield* dynamic.me()
+      return { authenticated, missing, invalid, mixed, health, dynamicHealth, dynamicMissing, dynamicAuthenticated }
     })))
 
     expect(result).toMatchObject({ authenticated: "user-1", health: "ok" })
     expect(result.missing).toMatchObject({ _tag: "Unauthorized" })
     expect(result.invalid).toMatchObject({ _tag: "Unauthorized" })
     expect(result.mixed).toMatchObject({ _tag: "Unauthorized" })
+    expect(result.dynamicHealth).toBe("ok")
+    expect(result.dynamicMissing).toMatchObject({ _tag: "Unauthorized" })
+    expect(result.dynamicAuthenticated).toBe("user-1")
   })
 
   it("rejects expired, premature, wrong-algorithm, wrong-type, issuer, audience, and claim JWTs", async () => {

@@ -4,10 +4,11 @@ import * as Layer from "effect/Layer"
 import * as Option from "effect/Option"
 import * as Redacted from "effect/Redacted"
 import * as Schema from "effect/Schema"
-import type * as Headers from "effect/unstable/http/Headers"
+import * as Headers from "effect/unstable/http/Headers"
 import type * as Rpc from "effect/unstable/rpc/Rpc"
 import type * as RpcGroup from "effect/unstable/rpc/RpcGroup"
 import type * as RpcMiddleware from "effect/unstable/rpc/RpcMiddleware"
+import * as RpcMiddlewareRuntime from "effect/unstable/rpc/RpcMiddleware"
 
 export type UnauthorizedReason = "Missing" | "Malformed" | "TooLong"
 
@@ -60,6 +61,33 @@ export const layerBearer = <MiddlewareId, PrincipalId, Principal, E, R>(
     )
   })
 }) as RpcMiddleware.RpcMiddleware<PrincipalId, E, R>)
+
+export interface ClientBearerOptions<R> {
+  /** Evaluated for every pipeline execution so refreshed credentials are observed. */
+  readonly token: Effect.Effect<Option.Option<string | Redacted.Redacted<string>>, never, R>
+}
+
+/**
+ * Supplies required client middleware while allowing anonymous calls in a
+ * mixed public/authenticated RpcGroup. `None` sends no credential; server
+ * middleware remains the authority for protected invocations.
+ */
+export const layerClientBearer = <MiddlewareId, Service, R>(
+  middleware: Context.Key<MiddlewareId, Service>,
+  options: ClientBearerOptions<R>
+): Layer.Layer<RpcMiddleware.ForClient<MiddlewareId>, never, R> =>
+  RpcMiddlewareRuntime.layerClient(middleware as any, ({ request, next }: any) =>
+    Effect.flatMap(options.token, Option.match({
+      onNone: () => next(request),
+      onSome: (token) => next({
+        ...request,
+        headers: Headers.set(
+          request.headers,
+          "authorization",
+          `Bearer ${Redacted.isRedacted(token) ? Redacted.value(token) : token}`
+        )
+      })
+    }))) as any
 
 export class UncoveredRpcs extends Schema.TaggedError<UncoveredRpcs>()("UncoveredRpcs", {
   rpcs: Schema.Array(Schema.String)

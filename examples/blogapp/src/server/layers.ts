@@ -4,6 +4,7 @@ import * as Layer from "effect/Layer"
 import * as PubSub from "effect/PubSub"
 import * as PipelineAuth from "effect-rpc-pipeline/Auth"
 import * as PipelineServer from "effect-rpc-pipeline/PipelineServer"
+import * as PipelineClient from "effect-rpc-pipeline/PipelineClient"
 import * as PipelineSql from "effect-rpc-pipeline/Sql"
 import * as PipelineTelemetry from "effect-rpc-pipeline/Telemetry"
 import * as RpcSerialization from "effect/unstable/rpc/RpcSerialization"
@@ -12,6 +13,9 @@ import { BlogDatabase, BlogDatabaseLive } from "./database.js"
 import { assertAuthenticationCoverage, makeAuthLayers } from "./authentication.js"
 import { makeApplicationLayer, makeTokenServiceLayer } from "./handlers/application.js"
 import { hashPassword } from "./security.js"
+import { SessionRoutesLive } from "./session-routes.js"
+import { SessionServiceLive } from "./sessions.js"
+import { AppPipelineClient, AuthenticatedClientLive, BlogClient, type BlogClientApi, makeFacade } from "../client/blog-client.js"
 
 const publicRpcs = [HealthRpc, RegisterRpc, LoginRpc, RefreshRpc, ListPostsRpc, GetPostRpc, GetUserRpc, ListCommentsRpc, WatchPostRpc] as const
 const mutationTags = new Set([
@@ -32,6 +36,7 @@ export const makeBlogLayers = (filename: string) => {
   const DatabaseLive = BlogDatabaseLive.pipe(Layer.provide(SqlLive))
   const TokenLive = makeTokenServiceLayer()
   const BaseLive = Layer.merge(DatabaseLive, TokenLive)
+  const SessionsLive = SessionServiceLive.pipe(Layer.provide(BaseLive))
 
   const InitializeLive = Layer.effectDiscard(Effect.gen(function*() {
     yield* assertAuthenticationCoverage.pipe(Effect.orDie)
@@ -48,23 +53,24 @@ export const makeBlogLayers = (filename: string) => {
     const changes = yield* PubSub.unbounded<BlogEvent>()
     const handlers = yield* makeApplicationLayer(changes)
     return Layer.mergeAll(handlers, makeAuthLayers)
-  })).pipe(Layer.provide(BaseLive))
+  })).pipe(Layer.provide(SessionsLive), Layer.provide(BaseLive))
 
   const telemetry = PipelineTelemetry.make({ tracing: { invocations: true, spanPrefix: "BlogRpc" }, metrics: { prefix: "blog_rpc" } })
   const transaction = PipelineSql.transaction({ when: (context) => context.rpcTags.some((tag) => mutationTags.has(tag)) })
-  const RoutesLive = Layer.merge(
+  const pipelineMiddleware = [telemetry, transaction, auditMiddleware] as const
+  const RpcRoutesLive = Layer.merge(
     PipelineServer.layerHttp({
       group: AppRpcs,
       path: "/rpc",
       id: "pipeline-press",
-      middleware: [telemetry, transaction, auditMiddleware],
+      middleware: pipelineMiddleware,
       limits: { maxNodes: 250, maxMapItems: 100, maxInvocations: 500, concurrency: 32 }
     }),
     PipelineServer.layerWebSocket({
       group: AppRpcs,
       path: "/rpc",
       id: "pipeline-press",
-      middleware: [telemetry, transaction, auditMiddleware],
+      middleware: pipelineMiddleware,
       limits: { maxNodes: 250, maxMapItems: 100, maxInvocations: 500, concurrency: 32 }
     })
   ).pipe(
@@ -74,5 +80,32 @@ export const makeBlogLayers = (filename: string) => {
     Layer.provide(RpcSerialization.layerJson)
   )
 
-  return { RoutesLive: Layer.merge(RoutesLive, InitializeLive), BaseLive, InitializeLive }
+  const RoutesLive = Layer.merge(
+    RpcRoutesLive,
+    SessionRoutesLive.pipe(Layer.provide(SessionsLive))
+  )
+
+  const InProcessPipelineLive = PipelineClient.layerClientInProcess(AppPipelineClient, AppRpcs, {
+    id: "pipeline-press",
+    middleware: pipelineMiddleware,
+    limits: { maxNodes: 250, maxMapItems: 100, maxInvocations: 500, concurrency: 32 }
+  }).pipe(
+    Layer.provide(AuthenticatedClientLive),
+    Layer.provide(ServicesLive),
+    Layer.provide(makeAuthLayers.pipe(Layer.provide(BaseLive))),
+    Layer.provide(BaseLive),
+    Layer.provide(SqlLive)
+  )
+  const InProcessClientLive = Layer.effect(
+    BlogClient,
+    Effect.map(AppPipelineClient, (rpc) => makeFacade(rpc) as unknown as BlogClientApi)
+  ).pipe(Layer.provide(InProcessPipelineLive))
+
+  return {
+    RoutesLive: Layer.merge(RoutesLive, InitializeLive),
+    InProcessClientLive: Layer.merge(InProcessClientLive, InitializeLive),
+    BaseLive,
+    SessionsLive,
+    InitializeLive
+  }
 }

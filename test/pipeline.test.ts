@@ -43,6 +43,28 @@ const local = async <Rpcs extends Rpc.Any>(group: RpcGroup.RpcGroup<Rpcs>, handl
 }
 
 describe("Effect-native pipeline client", () => {
+  it("provides an in-process graph client as a normal Effect service", async () => {
+    const App = RpcGroup.make(
+      Rpc.make("value", { success: Schema.Number }),
+      Rpc.make("double", { payload: { value: Schema.Number }, success: Schema.Number })
+    )
+    class AppClient extends Context.Service<AppClient, PipelineClient.Client<typeof App>>()("test/AppClient") {}
+    const HandlersLive = Layer.effectContext(App.toHandlers({
+      value: () => Effect.succeed(21),
+      double: ({ value }: { readonly value: number }) => Effect.succeed(value * 2)
+    }) as Effect.Effect<Context.Context<any>>)
+    const ClientLive = PipelineClient.layerClientInProcess(AppClient, App).pipe(Layer.provide(HandlersLive))
+    expectTypeOf<Layer.Services<typeof ClientLive>>().toEqualTypeOf<never>()
+
+    const result = await Effect.runPromise(Effect.gen(function*() {
+      const rpc = yield* AppClient
+      const value = rpc.value()
+      return yield* Pipeline.all({ value, doubled: rpc.double({ value }) })
+    }).pipe(Effect.provide(ClientLive)))
+
+    expect(result).toEqual({ value: 21, doubled: 42 })
+  })
+
   it("keeps exact tags and makes every call a yieldable Effect", async () => {
     const App = RpcGroup.make(Rpc.make("people.greet", { payload: { name: Schema.String }, success: Schema.String }))
     const { client, requests } = await local(App, { "people.greet": ({ name }: { name: string }) => Effect.succeed(`Hello ${name}`) })
@@ -627,7 +649,9 @@ describe("request batching and transactional execution", () => {
     class MutationFailed extends Schema.TaggedError<MutationFailed>()("MutationFailed", {}) {}
     const App = RpcGroup.make(
       Rpc.make("increment", { success: Schema.Number }),
+      Rpc.make("incrementAfterCommit", { success: Schema.Number }),
       Rpc.make("incrementAndFail", { success: Schema.Never, error: MutationFailed }),
+      Rpc.make("incrementScheduleAndFail", { success: Schema.Never, error: MutationFailed }),
       Rpc.make("readTransaction", {
         success: Schema.Struct({ value: Schema.Number, transaction: Schema.String })
       })
@@ -635,10 +659,20 @@ describe("request batching and transactional execution", () => {
     let value = 0
     const handlers = await Effect.runPromise(App.toHandlers({
       increment: () => Effect.sync(() => ++value),
+      incrementAfterCommit: () => Effect.gen(function*() {
+        const next = ++value
+        yield* PipelineSql.afterCommit(Effect.sync(() => events.push(`after-commit:${value}`)))
+        return next
+      }),
       incrementAndFail: () => Effect.andThen(
         Effect.sync(() => { value++ }),
         Effect.fail(new MutationFailed())
       ),
+      incrementScheduleAndFail: () => Effect.gen(function*() {
+        value++
+        yield* PipelineSql.afterCommit(Effect.sync(() => events.push("should-not-run")))
+        return yield* new MutationFailed()
+      }),
       // Effect SQL similarly hides its internal transaction-connection service
       // behind the SqlClient API while reading it dynamically at execution.
       readTransaction: () => Effect.map(TransactionConnection, ([connection]) => ({
@@ -686,10 +720,17 @@ describe("request batching and transactional execution", () => {
     ))
     expect(success).toEqual({ value: 1, transaction: "tx-1" })
 
+    expect(await Effect.runPromise(client.incrementAfterCommit())).toBe(2)
+    expect(events).toContain("commit:tx-2")
+    expect(events).toContain("after-commit:2")
+    expect(events.indexOf("commit:tx-2")).toBeLessThan(events.indexOf("after-commit:2"))
+
     const failure = await Effect.runPromise(Effect.flip(client.incrementAndFail()))
     expect(failure).toMatchObject({ _tag: "MutationFailed" })
-    expect(value).toBe(1)
-    expect(events).toEqual(["begin:tx-1", "commit:tx-1", "begin:tx-2", "rollback:tx-2"])
+    expect(value).toBe(2)
+    const scheduledFailure = await Effect.runPromise(Effect.flip(client.incrementScheduleAndFail()))
+    expect(scheduledFailure).toMatchObject({ _tag: "MutationFailed" })
+    expect(events).not.toContain("should-not-run")
 
     const invalid = await Effect.runPromise(PipelineServer.handle(App, {
       version: 1,
@@ -702,7 +743,7 @@ describe("request batching and transactional execution", () => {
       Effect.provideContext(handlers)
     ))
     expect(invalid).toMatchObject({ _tag: "Failure", error: { _tag: "PipelineProtocolError" } })
-    expect(events).toEqual(["begin:tx-1", "commit:tx-1", "begin:tx-2", "rollback:tx-2"])
+    expect(events.filter((event) => event.startsWith("begin:"))).toHaveLength(4)
   })
 
   it("returns a stable execution error when transaction infrastructure fails", async () => {

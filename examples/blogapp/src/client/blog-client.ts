@@ -1,27 +1,29 @@
+import * as Context from "effect/Context"
 import * as Effect from "effect/Effect"
+import * as Layer from "effect/Layer"
 import * as Option from "effect/Option"
-import * as Headers from "effect/unstable/http/Headers"
-import * as RpcMiddleware from "effect/unstable/rpc/RpcMiddleware"
+import * as Redacted from "effect/Redacted"
+import * as Schema from "effect/Schema"
 import type * as RpcGroup from "effect/unstable/rpc/RpcGroup"
 import * as RpcSerialization from "effect/unstable/rpc/RpcSerialization"
-import * as Stream from "effect/Stream"
 import * as Pipeline from "effect-rpc-pipeline/Pipeline"
+import * as PipelineAuth from "effect-rpc-pipeline/Auth"
 import * as PipelineClient from "effect-rpc-pipeline/PipelineClient"
-import { AppRpcs, Authenticated, PostCard, PostDetails, type PostStatus } from "../shared/contracts.js"
-
-export const clientAuthLayer = (accessToken: string) => RpcMiddleware.layerClient(Authenticated, ({ request, next }) =>
-  next({ ...request, headers: Headers.set(request.headers, "authorization", `Bearer ${accessToken}`) }))
-
-const clientOptionalAuthLayer = (accessToken?: string) => RpcMiddleware.layerClient(Authenticated, ({ request, next }) =>
-  next(accessToken === undefined ? request : { ...request, headers: Headers.set(request.headers, "authorization", `Bearer ${accessToken}`) }))
+import { AppRpcs, Authenticated, BrowserSession, PostCard, PostDetails, type PostStatus } from "../shared/contracts.js"
 
 type MaterializeMethod<A> = A extends (...args: infer Args) => infer Result
   ? (...args: Args) => Result extends Effect.Effect<infer Success, infer Error, any> ? Effect.Effect<Success, Error> : Result
   : A
 type Facade = ReturnType<typeof makeFacade>
-export type BlogClient = { readonly [Key in keyof Facade]: MaterializeMethod<Facade[Key]> }
+export type BlogClientApi = { readonly [Key in keyof Facade]: MaterializeMethod<Facade[Key]> }
 
 type AppClient = Pipeline.ClientApi<RpcGroup.Rpcs<typeof AppRpcs>>
+
+export class AppPipelineClient extends Context.Service<AppPipelineClient, AppClient>()("blog/AppPipelineClient") {}
+
+export class CurrentAccessToken extends Context.Reference<Option.Option<Redacted.Redacted<string>>>("blog/CurrentAccessToken", {
+  defaultValue: Option.none
+}) {}
 
 export const makeFacade = (rpc: AppClient) => ({
   health: () => rpc.health(),
@@ -85,35 +87,85 @@ export const makeFacade = (rpc: AppClient) => ({
   watchPost: (postId: string) => rpc.watchPost({ postId })
 })
 
-export const makeHttpClient = (url = "/rpc", accessToken?: string): Effect.Effect<BlogClient> => Effect.sync(() => {
-  const makeRpc = PipelineClient.make(AppRpcs, { id: "pipeline-press" }).pipe(
-    Effect.provide(clientOptionalAuthLayer(accessToken))
-  )
-  const run = <A, E, R>(use: (client: BlogClient) => Effect.Effect<A, E, R>) => Effect.scoped(Effect.gen(function*() {
-    const rpc = yield* makeRpc
-    return yield* use(makeFacade(rpc) as unknown as BlogClient)
-  })).pipe(
-    Effect.provide(PipelineClient.layerHttp({ url })),
-    Effect.provide(RpcSerialization.layerJson)
-  ) as Effect.Effect<A, E>
+export class BlogClient extends Context.Service<BlogClient, BlogClientApi>()("blog/BlogClient") {}
 
-  const client: BlogClient = {
-    health: () => run((c) => c.health()), register: (input) => run((c) => c.register(input)),
-    login: (input) => run((c) => c.login(input)), refresh: (token) => run((c) => c.refresh(token)),
-    feed: (search, tag) => run((c) => c.feed(search, tag)), post: (slug) => run((c) => c.post(slug)),
-    viewerPost: (slug) => run((c) => c.viewerPost(slug)), createPost: (input) => run((c) => c.createPost(input)),
-    updatePost: (input) => run((c) => c.updatePost(input)), deletePost: (id) => run((c) => c.deletePost(id)),
-    comment: (postId, body) => run((c) => c.comment(postId, body)), deleteComment: (id, postId) => run((c) => c.deleteComment(id, postId)),
-    toggleUpvote: (postId) => run((c) => c.toggleUpvote(postId)), myPosts: () => run((c) => c.myPosts()),
-    me: () => run((c) => c.me()), admin: () => run((c) => c.admin()),
-    setSuspended: (id, suspended) => run((c) => c.setSuspended(id, suspended)), setRole: (id, role) => run((c) => c.setRole(id, role)),
-    moderatePost: (id, status) => run((c) => c.moderatePost(id, status)), moderateComment: (id) => run((c) => c.moderateComment(id)),
-    openAuthorSession: (id) => run((c) => c.openAuthorSession(id)), registerNotificationSink: (sink) => run((c) => c.registerNotificationSink(sink)),
-    watchPost: (postId) => Stream.unwrap(makeRpc.pipe(
-      Effect.map((rpc) => makeFacade(rpc).watchPost(postId)),
-      Effect.provide(PipelineClient.layerHttp({ url })),
-      Effect.provide(RpcSerialization.layerJson)
-    ))
-  }
-  return client
+export const withAccessToken = <A, E, R>(
+  effect: Effect.Effect<A, E, R>,
+  accessToken: string
+): Effect.Effect<A, E, R> => Effect.provideService(effect, CurrentAccessToken, Option.some(Redacted.make(accessToken)))
+
+export const AuthenticatedClientLive = PipelineAuth.layerClientBearer(Authenticated, {
+  token: Effect.map(CurrentAccessToken, (token) => token)
+})
+
+export const layerHttpClient = (url = "/rpc") => {
+  const PipelineLive = PipelineClient.layerClientHttp(AppPipelineClient, AppRpcs, {
+    url,
+    id: "pipeline-press"
+  }).pipe(
+    Layer.provide(AuthenticatedClientLive),
+    Layer.provide(RpcSerialization.layerJson)
+  )
+  return Layer.effect(BlogClient, Effect.map(AppPipelineClient, (rpc) => makeFacade(rpc) as unknown as BlogClientApi)).pipe(Layer.provideMerge(PipelineLive))
+}
+
+export const layerWebSocketClient = (url: string) => {
+  const PipelineLive = PipelineClient.layerClientWebSocket(
+    AppPipelineClient,
+    AppRpcs,
+    { url, id: "pipeline-press" }
+  ).pipe(
+    Layer.provide(AuthenticatedClientLive),
+    Layer.provide(RpcSerialization.layerJson)
+  )
+  return Layer.effect(BlogClient, Effect.map(AppPipelineClient, (rpc) => makeFacade(rpc) as unknown as BlogClientApi)).pipe(Layer.provideMerge(PipelineLive))
+}
+
+export const makeHttpClient = (url = "/rpc", accessToken?: string): Effect.Effect<BlogClient["Service"]> =>
+  PipelineClient.makeHttp(AppRpcs, { url, id: "pipeline-press" }).pipe(
+    Effect.map((rpc) => makeFacade(rpc) as unknown as BlogClientApi),
+    Effect.provide(PipelineAuth.layerClientBearer(Authenticated, {
+      token: Effect.succeed(Option.fromNullishOr(accessToken))
+    })),
+    Effect.provide(RpcSerialization.layerJson)
+  )
+
+const decodeBrowserSession = Schema.decodeUnknownEffect(BrowserSession)
+
+const sessionRequest = (path: string, body?: unknown): Effect.Effect<BrowserSession, Error> => Effect.tryPromise({
+  try: async () => {
+    const response = await fetch(path, {
+      method: "POST",
+      credentials: "same-origin",
+      ...(body === undefined ? {} : {
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify(body)
+      })
+    })
+    const value = await response.json()
+    if (!response.ok) {
+      const message = value !== null && typeof value === "object" && "error" in value
+        ? String(value.error)
+        : `Session request failed with ${response.status}`
+      throw new Error(message)
+    }
+    return value
+  },
+  catch: (cause) => cause instanceof Error ? cause : new Error(String(cause))
+}).pipe(Effect.flatMap(decodeBrowserSession), Effect.mapError((cause) => cause instanceof Error ? cause : new Error(String(cause))))
+
+export const loginSession = (input: { readonly username: string; readonly password: string }) =>
+  sessionRequest("/session/login", input)
+
+export const registerSession = (input: { readonly username: string; readonly displayName: string; readonly password: string }) =>
+  sessionRequest("/session/register", input)
+
+export const refreshSession = sessionRequest("/session/refresh")
+
+export const logoutSession = Effect.tryPromise({
+  try: async () => {
+    const response = await fetch("/session/logout", { method: "POST", credentials: "same-origin" })
+    if (!response.ok) throw new Error(`Logout failed with ${response.status}`)
+  },
+  catch: (cause) => cause instanceof Error ? cause : new Error(String(cause))
 })

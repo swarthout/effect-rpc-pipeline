@@ -3,11 +3,11 @@ import { type Document, type Html, type HtmlBuilder } from "foldkit/html"
 import { type Model, type Page } from "../model.js"
 import { Message, type Message as MessageType } from "../message.js"
 import { button } from "./components.js"
-import { adminView, authView, editorView, feedView, postView } from "./pages.js"
+import { adminView, authView, editorView, feedView, notFoundView, postView } from "./pages.js"
 
 const pages: Record<Page, (model: Model, h: HtmlBuilder<MessageType>) => Html> = {
   Feed: feedView, Post: postView, Login: (model, h) => authView(model, h, false),
-  Register: (model, h) => authView(model, h, true), Editor: editorView, Admin: adminView
+  NotFound: notFoundView, Register: (model, h) => authView(model, h, true), Editor: editorView, Admin: adminView
 }
 
 export const view = (model: Model, h: HtmlBuilder<MessageType>): Document => ({

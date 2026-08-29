@@ -50,6 +50,7 @@ describe("native Effect WebSocket transport", () => {
         error: Schema.Literal("Unauthorized")
       })
     )
+    class AppClient extends Context.Service<AppClient, PipelineClient.Client<typeof App>>()("websocket/AppClient") {}
 
     const program = Effect.scoped(Effect.gen(function*() {
       const values: Array<string> = []
@@ -88,16 +89,16 @@ describe("native Effect WebSocket transport", () => {
       const httpUrl = `http://127.0.0.1:${server.address.port}/rpc`
       const url = `ws://127.0.0.1:${server.address.port}/rpc`
 
-      const httpInitial = yield* Effect.scoped(Effect.gen(function*() {
-        const httpClient = yield* PipelineClient.make(App, { id: "ws-test" })
+      const httpInitial = yield* Effect.gen(function*() {
+        const httpClient = yield* AppClient
         return yield* Pipeline.all({ values: httpClient.list(), details: httpClient.details() })
-      })).pipe(
-        Effect.provide(PipelineClient.layerHttp({ url: httpUrl })),
+      }).pipe(
+        Effect.provide(PipelineClient.layerClientHttp(AppClient, App, { url: httpUrl, id: "ws-test" })),
         Effect.provide(RpcSerialization.layerJson)
       )
 
       return yield* Effect.gen(function*() {
-        const client = yield* PipelineClient.make(App, { id: "ws-test" })
+        const client = yield* AppClient
         const initial = yield* client.list()
 
         const watched = yield* client.watch().pipe(Stream.take(1), Stream.runCollect, Effect.forkScoped)
@@ -116,7 +117,7 @@ describe("native Effect WebSocket transport", () => {
         const currentUser = yield* authed.currentUser()
         return { httpInitial, initial, state, events, accepted, rejected, currentUser }
       }).pipe(
-        Effect.provide(PipelineClient.layerWebSocket({ url })),
+        Effect.provide(PipelineClient.layerClientWebSocket(AppClient, App, { url, id: "ws-test" })),
         Effect.provide(RpcSerialization.layerJson),
         Effect.provide(Socket.layerWebSocketConstructorGlobal)
       )

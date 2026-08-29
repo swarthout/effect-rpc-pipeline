@@ -3,20 +3,26 @@ import * as Effect from "effect/Effect"
 import * as Layer from "effect/Layer"
 import * as Option from "effect/Option"
 import type * as Scope from "effect/Scope"
+import * as Stream from "effect/Stream"
 import * as FetchHttpClient from "effect/unstable/http/FetchHttpClient"
 import * as Headers from "effect/unstable/http/Headers"
 import type * as RpcMiddleware from "effect/unstable/rpc/RpcMiddleware"
 import * as RpcClient from "effect/unstable/rpc/RpcClient"
 import { RpcClientDefect, RpcClientError } from "effect/unstable/rpc/RpcClientError"
-import type * as Rpc from "effect/unstable/rpc/Rpc"
+import * as Rpc from "effect/unstable/rpc/Rpc"
 import * as RpcGroup from "effect/unstable/rpc/RpcGroup"
-import type * as RpcSerialization from "effect/unstable/rpc/RpcSerialization"
+import * as RpcSerialization from "effect/unstable/rpc/RpcSerialization"
 import { RequestId } from "effect/unstable/rpc/RpcMessage"
 import * as Socket from "effect/unstable/socket/Socket"
 import type { ClientApi, PipelineRequest, PipelineTransport } from "./Pipeline.js"
 import { makeClient } from "./Pipeline.js"
 import * as Duplex from "./Duplex.js"
-import { PipelineRpc } from "./PipelineServer.js"
+import * as PipelineServer from "./PipelineServer.js"
+
+const { PipelineRpc } = PipelineServer
+
+/** The generated pipeline client type for an Effect RpcGroup. */
+export type Client<Group extends RpcGroup.RpcGroup<any>> = ClientApi<RpcGroup.Rpcs<Group>>
 
 export type PipelineResponse =
   | { readonly _tag: "Success"; readonly value: unknown }
@@ -130,11 +136,11 @@ const makeWithTransport = <Rpcs extends Rpc.Any>(
   return makeClient(group, id, execute)
 })
 
-const makeNative = <Rpcs extends Rpc.Any>(
+const makeNativeResources = <Rpcs extends Rpc.Any>(
   group: RpcGroup.RpcGroup<Rpcs>,
-  id: string
-): Effect.Effect<ClientApi<Rpcs>, never, RpcClient.Protocol | Rpc.MiddlewareClient<Rpcs> | Scope.Scope> => Effect.gen(function*() {
-  const middlewareServices = yield* Effect.context<Rpc.MiddlewareClient<Rpcs>>()
+  id: string,
+  middlewareServices: Context.Context<Rpc.MiddlewareClient<Rpcs>>
+) => Effect.gen(function*() {
   let requestSequence = 0
   const combined = group
     .add(PipelineRpc)
@@ -163,11 +169,130 @@ const makeNative = <Rpcs extends Rpc.Any>(
   }).pipe(Effect.mapError((cause) => cause && typeof cause === "object" && "_tag" in cause
     ? cause
     : new RpcClientError({ reason: new RpcClientDefect({ message: "Pipeline request failed", cause }) })))
-  return makeClient(group, id, execute, {
-    streamClient: client as any,
+  return {
+    execute,
+    streamClient: client as Record<string, (...args: ReadonlyArray<any>) => unknown>,
     ...(session === undefined ? {} : { encodeLiteral: session.encodeLiteral })
+  }
+})
+
+const makeNative = <Rpcs extends Rpc.Any>(
+  group: RpcGroup.RpcGroup<Rpcs>,
+  id: string
+): Effect.Effect<ClientApi<Rpcs>, never, RpcClient.Protocol | Rpc.MiddlewareClient<Rpcs> | Scope.Scope> => Effect.gen(function*() {
+  const middlewareServices = yield* Effect.context<Rpc.MiddlewareClient<Rpcs>>()
+  const resources = yield* makeNativeResources(group, id, middlewareServices)
+  return makeClient(group, id, resources.execute, {
+    streamClient: resources.streamClient,
+    ...("encodeLiteral" in resources ? { encodeLiteral: resources.encodeLiteral } : {})
   })
 })
+
+const makeResourceSafe = <Rpcs extends Rpc.Any>(
+  group: RpcGroup.RpcGroup<Rpcs>,
+  id: string,
+  protocol: Layer.Layer<RpcClient.Protocol, never, any>
+): Effect.Effect<ClientApi<Rpcs>, never, Rpc.MiddlewareClient<Rpcs> | Exclude<Layer.Services<typeof protocol>, Scope.Scope>> => Effect.gen(function*() {
+  const middlewareServices = yield* Effect.context<Rpc.MiddlewareClient<Rpcs>>()
+  const serialization = yield* RpcSerialization.RpcSerialization
+  const acquire = makeNativeResources(group, id, middlewareServices).pipe(
+    Effect.provide(protocol),
+    Effect.provideService(RpcSerialization.RpcSerialization, serialization)
+  )
+  const execute = (request: PipelineRequest) => Effect.scoped(Effect.flatMap(acquire, (resources) => resources.execute(request)))
+  const streamClient = new Proxy({}, {
+    get: (_target, property) => (...args: ReadonlyArray<any>) => Stream.unwrap(
+      Effect.map(acquire, (resources) => (resources.streamClient as any)[property](...args))
+    )
+  }) as Record<string, (...args: ReadonlyArray<any>) => unknown>
+  return makeClient(group, id, execute as any, { streamClient })
+}) as any
+
+/**
+ * Creates a reusable HTTP client facade. Each pipeline execution owns a fresh
+ * internal scope; the returned facade itself is not scoped.
+ */
+export const makeHttp = <Rpcs extends Rpc.Any>(
+  group: RpcGroup.RpcGroup<Rpcs>,
+  options: Parameters<typeof layerHttp>[0] & { readonly id?: string }
+): Effect.Effect<ClientApi<Rpcs>, never, RpcSerialization.RpcSerialization | Rpc.MiddlewareClient<Rpcs>> =>
+  makeResourceSafe(group, options.id ?? "default", layerHttp(options)) as any
+
+/** Creates a WebSocket client whose connection and capabilities live in Scope. */
+export const makeWebSocket = <Rpcs extends Rpc.Any>(
+  group: RpcGroup.RpcGroup<Rpcs>,
+  options: Parameters<typeof layerWebSocket>[0] & { readonly id?: string }
+): Effect.Effect<
+  ClientApi<Rpcs>,
+  never,
+  RpcSerialization.RpcSerialization | Socket.WebSocketConstructor | Rpc.MiddlewareClient<Rpcs> | Scope.Scope
+> => Effect.gen(function*() {
+  const root = yield* Effect.context<
+    RpcSerialization.RpcSerialization | Socket.WebSocketConstructor | Rpc.MiddlewareClient<Rpcs> | Scope.Scope
+  >()
+  const protocol = yield* Layer.build(layerWebSocket(options))
+  return yield* makeNative(group, options.id ?? "default").pipe(
+    Effect.provideContext(Context.merge(root, protocol) as any)
+  )
+}) as any
+
+export interface InProcessOptions<M extends ReadonlyArray<PipelineServer.Middleware<any, any>> = readonly []> {
+  readonly id?: string
+  readonly middleware?: M
+  readonly limits?: PipelineServer.ServerOptions<M>["limits"]
+}
+
+/** Creates a transport-free client that runs the normal pipeline server locally. */
+export const makeInProcess = <Rpcs extends Rpc.Any, const M extends ReadonlyArray<PipelineServer.Middleware<any, any>> = readonly []>(
+  group: RpcGroup.RpcGroup<Rpcs>,
+  options: InProcessOptions<M> = {}
+): Effect.Effect<
+  ClientApi<Rpcs>,
+  never,
+  Rpc.MiddlewareClient<Rpcs> | PipelineServer.Requirements<Rpcs> | PipelineServer.MiddlewaresRequirements<M>
+> => Effect.gen(function*() {
+  const context = yield* Effect.context<Rpc.MiddlewareClient<Rpcs> | PipelineServer.Requirements<Rpcs> | PipelineServer.MiddlewaresRequirements<M>>()
+  let requestSequence = 0
+  return yield* makeWithTransport(group, (request, transportOptions) => PipelineServer.handle(group, request, {
+    ...(options.id === undefined ? {} : { id: options.id }),
+    ...(options.middleware === undefined ? {} : { middleware: options.middleware }),
+    ...(options.limits === undefined ? {} : { limits: options.limits }),
+    metadata: {
+      client: new Rpc.ServerClient(0),
+      requestId: `in-process:${requestSequence++}`,
+      headers: transportOptions?.headers ?? Headers.empty
+    }
+  }).pipe(Effect.provideContext(context as any)), options.id ?? "default").pipe(Effect.provideContext(context as any))
+}) as any
+
+type ClientService<I, Rpcs extends Rpc.Any> = Context.Key<I, ClientApi<Rpcs>>
+
+/** Provides a resource-safe HTTP pipeline client as an Effect service. */
+export const layerClientHttp = <I, Rpcs extends Rpc.Any>(
+  service: ClientService<I, Rpcs>,
+  group: RpcGroup.RpcGroup<Rpcs>,
+  options: Parameters<typeof layerHttp>[0] & { readonly id?: string }
+): Layer.Layer<I, never, RpcSerialization.RpcSerialization | Rpc.MiddlewareClient<Rpcs>> =>
+  Layer.effect(service, makeHttp(group, options))
+
+/** Provides one scoped WebSocket connection as an Effect service. */
+export const layerClientWebSocket = <I, Rpcs extends Rpc.Any>(
+  service: ClientService<I, Rpcs>,
+  group: RpcGroup.RpcGroup<Rpcs>,
+  options: Parameters<typeof layerWebSocket>[0] & { readonly id?: string }
+): Layer.Layer<
+  I,
+  never,
+  RpcSerialization.RpcSerialization | Socket.WebSocketConstructor | Rpc.MiddlewareClient<Rpcs>
+> => Layer.effect(service, makeWebSocket(group, options))
+
+/** Provides an in-process pipeline client as an Effect service. */
+export const layerClientInProcess = <I, Rpcs extends Rpc.Any, const M extends ReadonlyArray<PipelineServer.Middleware<any, any>> = readonly []>(
+  service: ClientService<I, Rpcs>,
+  group: RpcGroup.RpcGroup<Rpcs>,
+  options: InProcessOptions<M> = {}
+): Layer.Layer<I, never, Rpc.MiddlewareClient<Rpcs> | PipelineServer.Requirements<Rpcs> | PipelineServer.MiddlewaresRequirements<M>> =>
+  Layer.effect(service, makeInProcess(group, options))
 
 /** Creates a client using a supplied transport or the Effect-native Protocol service. */
 export function make<Rpcs extends Rpc.Any>(

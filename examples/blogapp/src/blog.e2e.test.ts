@@ -18,7 +18,7 @@ import * as Socket from "effect/unstable/socket/Socket"
 import * as Pipeline from "effect-rpc-pipeline/Pipeline"
 import * as PipelineClient from "effect-rpc-pipeline/PipelineClient"
 import { describe, expect, it } from "vitest"
-import { clientAuthLayer, makeFacade, makeHttpClient } from "./client/blog-client.js"
+import { AppPipelineClient, BlogClient, layerWebSocketClient, makeHttpClient, withAccessToken } from "./client/blog-client.js"
 import { AppRpcs, NotificationSink } from "./shared/contracts.js"
 import { makeBlogLayers } from "./server/layers.js"
 
@@ -38,6 +38,10 @@ const testServer = <A, E, R>(run: (urls: { readonly http: string; readonly webso
 }))
 
 describe("Pipeline Press end to end", () => {
+  const within = <A, E, R>(label: string, effect: Effect.Effect<A, E, R>) => effect.pipe(
+    Effect.timeout("3 seconds"),
+    Effect.catchTag("TimeoutError", () => Effect.die(`${label} timed out`))
+  )
   it("supports public reading and the complete authenticated blog workflow", async () => {
     const result = await Effect.runPromise(testServer(({ http }) => Effect.gen(function*() {
       const publicClient = yield* makeHttpClient(http)
@@ -109,6 +113,48 @@ describe("Pipeline Press end to end", () => {
     expect(result.suspendedLogin).toMatchObject({ _tag: "Suspended" })
   })
 
+  it("keeps rotating refresh tokens in secure browser cookies", async () => {
+    await Effect.runPromise(testServer(({ http }) => Effect.promise(async () => {
+      const origin = http.slice(0, -"/rpc".length)
+      const request = (path: string, options: RequestInit = {}) => fetch(`${origin}${path}`, {
+        method: "POST",
+        headers: { origin, ...(options.headers ?? {}) },
+        ...options
+      })
+      const registered = await request("/session/register", {
+        headers: { origin, "content-type": "application/json" },
+        body: JSON.stringify({ username: "browser", displayName: "Browser User", password: "a browser-safe password" })
+      })
+      const body = await registered.json() as Record<string, unknown>
+      expect(registered.status, JSON.stringify(body)).toBe(200)
+      expect(body.accessToken).toEqual(expect.any(String))
+      expect(body).not.toHaveProperty("refreshToken")
+      const firstCookie = registered.headers.get("set-cookie")!
+      expect(firstCookie).toContain("HttpOnly")
+      expect(firstCookie).toContain("Secure")
+      expect(firstCookie).toContain("SameSite=Lax")
+
+      const refreshed = await request("/session/refresh", { headers: { origin, cookie: firstCookie.split(";", 1)[0]! } })
+      expect(refreshed.status).toBe(200)
+      const secondCookie = refreshed.headers.get("set-cookie")!
+      expect(secondCookie).not.toBe(firstCookie)
+
+      const replay = await request("/session/refresh", { headers: { origin, cookie: firstCookie.split(";", 1)[0]! } })
+      expect(replay.status).toBe(401)
+      const crossOrigin = await fetch(`${origin}/session/refresh`, {
+        method: "POST",
+        headers: { origin: "https://attacker.example", cookie: secondCookie.split(";", 1)[0]! }
+      })
+      expect(crossOrigin.status).toBe(403)
+
+      const logout = await request("/session/logout", { headers: { origin, cookie: secondCookie.split(";", 1)[0]! } })
+      expect(logout.status).toBe(204)
+      expect(logout.headers.get("set-cookie")).toContain("Max-Age=0")
+      const afterLogout = await request("/session/refresh", { headers: { origin, cookie: secondCookie.split(";", 1)[0]! } })
+      expect(afterLogout.status).toBe(401)
+    })))
+  })
+
   it("runs streams, server capabilities, client callbacks, and pipelines over one WebSocket", async () => {
     const result = await Effect.runPromise(testServer(({ http, websocket }) => Effect.gen(function*() {
       const publicClient = yield* makeHttpClient(http)
@@ -123,8 +169,8 @@ describe("Pipeline Press end to end", () => {
       })
 
       return yield* Effect.gen(function*() {
-        const rpc = yield* PipelineClient.make(AppRpcs, { id: "pipeline-press" })
-        const client = makeFacade(rpc)
+        const client = yield* BlogClient
+        const rpc = yield* AppPipelineClient
         const events = yield* Queue.unbounded<unknown>()
         const streamFiber = yield* client.watchPost(created.post.id).pipe(
           Stream.take(1),
@@ -134,7 +180,7 @@ describe("Pipeline Press end to end", () => {
 
         const authorSession = yield* client.openAuthorSession(created.post.id)
         const published = yield* authorSession.publish()
-        const event = yield* Queue.take(events)
+        const event = yield* within("post event", Queue.take(events))
         yield* Fiber.interrupt(streamFiber)
 
         const notifications = yield* Queue.unbounded<unknown>()
@@ -142,18 +188,17 @@ describe("Pipeline Press end to end", () => {
           notify: ({ event }) => Queue.offer(notifications, event).pipe(Effect.as(true))
         })
         const callbackAccepted = yield* client.registerNotificationSink(sink)
-        const notification = yield* Queue.take(notifications)
+        const notification = yield* within("client callback", Queue.take(notifications))
 
         const combined = yield* Pipeline.all({
-          current: client.me(),
-          drafts: client.myPosts(),
+          current: rpc.me(),
+          drafts: rpc.myPosts(),
           author: rpc.getUser({ id: published.authorId })
         })
         return { published, event, callbackAccepted, notification, combined }
       }).pipe(
-        Effect.provide(clientAuthLayer(session.accessToken)),
-        Effect.provide(PipelineClient.layerWebSocket({ url: websocket })),
-        Effect.provide(RpcSerialization.layerJson),
+        (effect) => withAccessToken(effect, session.accessToken),
+        Effect.provide(layerWebSocketClient(websocket)),
         Effect.provide(Socket.layerWebSocketConstructorGlobal)
       )
     })) as Effect.Effect<any, any, never>)

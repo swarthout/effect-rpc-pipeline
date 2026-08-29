@@ -1,15 +1,22 @@
 import { Option, Schema as S } from "effect"
-import { AdminSummary, AuthTokens, PostCard, PostDetails } from "../shared/contracts.js"
+import { AdminSummary, BrowserSession, PostCard, PostDetails } from "../shared/contracts.js"
 
-export const Page = S.Literals(["Feed", "Post", "Login", "Register", "Editor", "Admin"])
+export const Page = S.Literals(["Feed", "Post", "NotFound", "Login", "Register", "Editor", "Admin"])
 export type Page = typeof Page.Type
+
+export const Flags = S.Struct({
+  page: S.Literals(["Feed", "Post", "NotFound"]),
+  feed: S.Array(PostCard),
+  maybePost: S.Option(PostDetails)
+})
+export type Flags = typeof Flags.Type
 
 export const Model = S.Struct({
   page: Page,
   loadState: S.Literals(["Idle", "Loading", "Ready", "Failed"]),
   feed: S.Array(PostCard),
   maybePost: S.Option(PostDetails),
-  maybeSession: S.Option(AuthTokens),
+  maybeSession: S.Option(BrowserSession),
   maybeAdmin: S.Option(AdminSummary),
   editingPostId: S.Option(S.String),
   search: S.String, username: S.String, displayName: S.String, password: S.String,
@@ -24,3 +31,11 @@ export const initialModel: Model = {
   maybeAdmin: Option.none(), editingPostId: Option.none(), search: "", username: "", displayName: "",
   password: "", title: "", excerpt: "", body: "", tags: "", postStatus: "Draft", commentBody: "", error: ""
 }
+
+export const modelFromFlags = (flags: Flags): Model => ({
+  ...initialModel,
+  page: flags.page,
+  loadState: "Ready",
+  feed: flags.feed,
+  maybePost: flags.maybePost
+})

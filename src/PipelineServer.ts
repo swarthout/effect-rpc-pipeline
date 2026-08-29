@@ -57,8 +57,8 @@ export interface Middleware<EX = never, RX = never> {
 
 export const makeMiddleware = <RX = never, EX = never>(middleware: Middleware<EX, RX>): Middleware<EX, RX> => middleware
 
-type MiddlewareRequirements<M> = M extends Middleware<any, infer R> ? R : never
-type MiddlewaresRequirements<M extends ReadonlyArray<Middleware<any, any>>> = MiddlewareRequirements<M[number]>
+export type MiddlewareRequirements<M> = M extends Middleware<any, infer R> ? R : never
+export type MiddlewaresRequirements<M extends ReadonlyArray<Middleware<any, any>>> = MiddlewareRequirements<M[number]>
 
 export interface ServerOptions<M extends ReadonlyArray<Middleware<any, any>> = readonly []> {
   readonly id?: string

@@ -23,6 +23,12 @@ export const postView = (model: Model, h: HtmlBuilder<MessageType>): Html => Opt
   ])
 })
 
+export const notFoundView = (_model: Model, h: HtmlBuilder<MessageType>): Html => h.main([h.Class("panel stack")], [
+  h.h1([], ["Article not found"]),
+  h.p([], ["This article does not exist or is not published."]),
+  button("Back to articles", Message.ClickedFeed(), h)
+])
+
 export const authView = (model: Model, h: HtmlBuilder<MessageType>, register: boolean): Html => h.main([h.Class("narrow panel stack")], [
   h.h1([], [register ? "Create an account" : "Log in"]),
   register ? input("display-name", "Display name", model.displayName, (value) => Message.ChangedDisplayName({ value }), h) : h.p([], ["Use admin / admin-password-change-me for the seeded administrator."]),

@@ -12,6 +12,7 @@ export class PostCard extends Schema.Class<PostCard>("PostCard")({ post: Post, a
 export class CommentView extends Schema.Class<CommentView>("CommentView")({ comment: Comment, author: User, canDelete: Schema.Boolean }) {}
 export class PostDetails extends Schema.Class<PostDetails>("PostDetails")({ post: Post, author: User, comments: Schema.Array(CommentView), viewerUpvoted: Schema.OptionFromNullOr(Schema.Boolean), canEdit: Schema.Boolean }) {}
 export class AuthTokens extends Schema.Class<AuthTokens>("AuthTokens")({ accessToken: Schema.String, refreshToken: Schema.String, expiresAt: Schema.Number, user: User }) {}
+export class BrowserSession extends Schema.Class<BrowserSession>("BrowserSession")({ accessToken: Schema.String, expiresAt: Schema.Number, user: User }) {}
 export class AdminSummary extends Schema.Class<AdminSummary>("AdminSummary")({ users: Schema.Array(User), posts: Schema.Array(Post), comments: Schema.Array(Comment), publishedPosts: Schema.Number, suspendedUsers: Schema.Number }) {}
 export const BlogEventKind = Schema.Literals(["PostChanged", "CommentAdded", "CommentDeleted", "VoteChanged", "Moderated"])
 export class BlogEvent extends Schema.Class<BlogEvent>("BlogEvent")({ kind: BlogEventKind, postId: Schema.String, message: Schema.String, occurredAt: Schema.Number }) {}
