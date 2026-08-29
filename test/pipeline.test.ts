@@ -95,6 +95,20 @@ describe("Effect-native pipeline client", () => {
     expect(await Effect.runPromise(Pipeline.map(client.maybe({ found: false }), (value) => ({ value })))).toEqual(Option.none())
   })
 
+  it("decodes Effect Option values in RPC payloads", async () => {
+    const App = RpcGroup.make(Rpc.make("describe", {
+      payload: { filter: Schema.OptionFromNullOr(Schema.String) },
+      success: Schema.String
+    }))
+    const { client } = await local(App, {
+      describe: ({ filter }: { filter: Option.Option<string> }) => Effect.succeed(
+        Option.match(filter, { onNone: () => "all", onSome: (value) => `only:${value}` })
+      )
+    })
+    expect(await Effect.runPromise(client.describe({ filter: Option.none() }) as unknown as Effect.Effect<string, any, never>)).toBe("all")
+    expect(await Effect.runPromise(client.describe({ filter: Option.some("effect") }) as unknown as Effect.Effect<string, any, never>)).toBe("only:effect")
+  })
+
   it("orders a mutation before a combined query", async () => {
     const App = RpcGroup.make(
       Rpc.make("addTodo", { payload: { title: Schema.String }, success: Schema.Void }),

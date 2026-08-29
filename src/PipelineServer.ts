@@ -155,6 +155,42 @@ const evalExpr = (expr: Expr, values: Map<string, unknown>, item?: unknown): unk
   }
 }
 
+// Pipeline expressions preserve Effect values so they can be selected and mapped.
+// RPC payload schemas, however, decode from their encoded wire representation.
+const encodePayloadOptions = (value: unknown): unknown => {
+  if (Option.isOption(value)) return Option.isNone(value) ? null : encodePayloadOptions(value.value)
+  if (Array.isArray(value)) return value.map(encodePayloadOptions)
+  if (value !== null && typeof value === "object" && !isInstance(value) && !isRef(value)) {
+    return Object.fromEntries(Object.entries(value).map(([key, item]) => [key, encodePayloadOptions(item)]))
+  }
+  return value
+}
+
+const encodeTransportValue = (value: unknown, ancestors = new WeakSet<object>()): unknown => {
+  if (Option.isOption(value)) return Option.isNone(value)
+    ? { _id: "Option", _tag: "None" }
+    : { _id: "Option", _tag: "Some", value: encodeTransportValue(value.value, ancestors) }
+  if (typeof value === "number" && !Number.isFinite(value)) return null
+  if (typeof value === "bigint" || typeof value === "symbol") return String(value)
+  if (Array.isArray(value)) {
+    if (ancestors.has(value)) return "[Circular]"
+    ancestors.add(value)
+    const encoded = value.map((item) => encodeTransportValue(item, ancestors))
+    ancestors.delete(value)
+    return encoded
+  }
+  if (value !== null && typeof value === "object") {
+    if (ancestors.has(value)) return "[Circular]"
+    ancestors.add(value)
+    const encoded = Object.fromEntries(Object.entries(value).flatMap(([key, item]) =>
+      item === undefined || typeof item === "function" ? [] : [[key, encodeTransportValue(item, ancestors)]]
+    ))
+    ancestors.delete(value)
+    return encoded
+  }
+  return value
+}
+
 const dependencies = (node: PipelineNode): ReadonlyArray<string> => node.dependencies
 
 const containsItem = (expr: Expr): boolean => {
@@ -295,7 +331,8 @@ const executeNode = <R extends Rpc.Any>(
   return Effect.try({ try: () => evalExpr(node.payload, values, item), catch: (error) => error }).pipe(
     Effect.flatMap((rawPayload) => {
       const duplex = Context.getOrUndefined(context, Duplex.Server)
-      const payload = duplex === undefined ? rawPayload : Duplex.resolveServerValue(duplex, metadata.client.id, rawPayload)
+      const resolvedPayload = duplex === undefined ? rawPayload : Duplex.resolveServerValue(duplex, metadata.client.id, rawPayload)
+      const payload = encodePayloadOptions(resolvedPayload)
       const rawTarget = node.target ? evalExpr(node.target, values, item) : undefined
       const target = duplex === undefined ? rawTarget : Duplex.resolveServerValue(duplex, metadata.client.id, rawTarget)
       if (target !== undefined && !isInstance(target)) return Effect.fail(new PipelineProtocolError("Call target is not a capability", "InvalidTarget"))
@@ -445,10 +482,10 @@ const handleWithContext = <R extends Rpc.Any, M extends ReadonlyArray<Middleware
       }
       return Effect.succeed({
         _tag: "Success",
-        value: duplex === undefined ? value : Duplex.encodeServerValue(duplex, metadata.client.id, value)
+        value: encodeTransportValue(duplex === undefined ? value : Duplex.encodeServerValue(duplex, metadata.client.id, value))
       })
     }),
-    Effect.catch((error): Effect.Effect<PipelineResponse> => Effect.succeed({ _tag: "Failure", error }))
+    Effect.catch((error): Effect.Effect<PipelineResponse> => Effect.succeed({ _tag: "Failure", error: encodeTransportValue(error) }))
   ) as Effect.Effect<PipelineResponse, never, never>
 }
 

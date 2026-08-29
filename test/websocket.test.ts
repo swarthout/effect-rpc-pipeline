@@ -4,6 +4,7 @@ import * as Deferred from "effect/Deferred"
 import * as Effect from "effect/Effect"
 import * as Fiber from "effect/Fiber"
 import * as Layer from "effect/Layer"
+import * as Option from "effect/Option"
 import * as PubSub from "effect/PubSub"
 import * as Schema from "effect/Schema"
 import * as Stream from "effect/Stream"
@@ -29,9 +30,14 @@ describe("native Effect WebSocket transport", () => {
     const Approval = Capability.make("websocket/Approval", ApprovalRpcs)
     const AuthedRpcs = RpcGroup.make(Rpc.make("currentUser", { success: Schema.String }))
     const AuthedApi = Capability.make("websocket/AuthedApi", AuthedRpcs)
+    class Details extends Schema.Class<Details>("Details")({
+      title: Schema.String,
+      subtitle: Schema.OptionFromNullOr(Schema.String)
+    }) {}
     const App = RpcGroup.make(
       Rpc.make("add", { payload: { title: Schema.String }, success: Schema.Number }),
       Rpc.make("list", { success: Schema.Array(Schema.String) }),
+      Rpc.make("details", { success: Details }),
       Rpc.make("watch", { success: Schema.String, stream: true }),
       Rpc.make("confirmAdd", {
         payload: { title: Schema.String, approval: Approval.schema },
@@ -56,6 +62,7 @@ describe("native Effect WebSocket transport", () => {
           return values.length
         }),
         list: () => Effect.sync(() => [...values]),
+        details: () => Effect.succeed(new Details({ title: "Pipeline", subtitle: Option.none() })),
         watch: () => Stream.unwrap(Effect.as(Deferred.succeed(subscribed, undefined), Stream.fromPubSub(changes))),
         confirmAdd: ({ title, approval }) => approval.approve({ title }),
         authenticate: ({ token }) => token !== "secret"
@@ -83,7 +90,7 @@ describe("native Effect WebSocket transport", () => {
 
       const httpInitial = yield* Effect.scoped(Effect.gen(function*() {
         const httpClient = yield* PipelineClient.make(App, { id: "ws-test" })
-        return yield* httpClient.list()
+        return yield* Pipeline.all({ values: httpClient.list(), details: httpClient.details() })
       })).pipe(
         Effect.provide(PipelineClient.layerHttp({ url: httpUrl })),
         Effect.provide(RpcSerialization.layerJson)
@@ -117,7 +124,7 @@ describe("native Effect WebSocket transport", () => {
 
     const result = await Effect.runPromise(program)
     expect(result).toEqual({
-      httpInitial: [],
+      httpInitial: { values: [], details: { title: "Pipeline", subtitle: Option.none() } },
       initial: [],
       state: { count: 1, values: ["one"] },
       events: ["one"],

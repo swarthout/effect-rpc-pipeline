@@ -957,3 +957,9 @@ Use the generic server middleware integration for rate limits and quotas. Authen
 - end-to-end tests for the full TodoMVC workflow.
 
 See [`examples/todoapp/README.md`](./examples/todoapp/README.md) for commands and entry points.
+
+## Full-stack blog example
+
+[`examples/blogapp`](./examples/blogapp) is a production-shaped Effect, Node.js, SQLite, JWT, and Foldkit application. It covers public reading, registration, post authoring and editing, comments, upvotes, administration, refresh-token rotation, request batching, SQL transactions, telemetry, HTTP and WebSocket transports, streams, server capabilities, and client callbacks.
+
+See [`examples/blogapp/README.md`](./examples/blogapp/README.md) for the architecture, setup, pipeline patterns, security model, and test coverage. Package issues discovered through the example are tracked in [`examples/blogapp/PACKAGE_AUDIT.md`](./examples/blogapp/PACKAGE_AUDIT.md).
