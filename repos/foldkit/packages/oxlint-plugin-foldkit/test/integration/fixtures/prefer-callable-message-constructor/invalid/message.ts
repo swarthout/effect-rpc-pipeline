@@ -1,0 +1,12 @@
+import { Schema as S } from 'effect'
+import { defineMessageUnion } from 'foldkit/message'
+
+
+const Message = defineMessageUnion({
+  ClickedSave: {},
+})
+type Message = typeof Message.Type
+
+const initialMessage: Message = {
+  _tag: 'ClickedSave',
+}
