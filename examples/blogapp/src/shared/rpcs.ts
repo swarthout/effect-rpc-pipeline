@@ -29,7 +29,7 @@ export const ProtectedRpcs = RpcGroup.make(
   Rpc.make("deleteComment", { payload: { id: Schema.String }, success: Schema.Boolean, error: Schema.Union([Forbidden, NotFound]) }),
   Rpc.make("toggleUpvote", { payload: { postId: Schema.String }, success: Schema.Boolean, error: Schema.Union([Forbidden, NotFound]) }),
   Rpc.make("hasUpvoted", { payload: { postId: Schema.String }, success: Schema.OptionFromNullOr(Schema.Boolean) }),
-  Rpc.make("canDeleteComment", { payload: { commentId: Schema.String }, success: Schema.Boolean, error: NotFound }),
+  Rpc.make("canDeleteComment", { payload: { authorId: Schema.String }, success: Schema.Boolean }),
   Rpc.make("openAuthorSession", { payload: { postId: Schema.String }, success: AuthorSession.schema, error: Schema.Union([Forbidden, NotFound]) }),
   Rpc.make("registerNotificationSink", { payload: { sink: NotificationSink.schema }, success: Schema.Boolean, error: Schema.Union([Capability.CapabilityUnavailable, Capability.CapabilityTransportError]) }),
   Rpc.make("adminSummary", { success: AdminSummary, error: Forbidden }),
@@ -37,6 +37,6 @@ export const ProtectedRpcs = RpcGroup.make(
   Rpc.make("setUserRole", { payload: { userId: Schema.String, role: Role }, success: User, error: Schema.Union([Forbidden, NotFound]) }),
   Rpc.make("moderatePost", { payload: { postId: Schema.String, status: PostStatus }, success: Post, error: Schema.Union([Forbidden, NotFound, InvalidInput]) }),
   Rpc.make("moderateComment", { payload: { commentId: Schema.String }, success: Schema.Boolean, error: Schema.Union([Forbidden, NotFound]) })
-).middleware(Authenticated)
+).middleware(Authenticated).middleware(RequestBatching.Middleware)
 
 export const AppRpcs = PublicRpcs.merge(ProtectedRpcs)

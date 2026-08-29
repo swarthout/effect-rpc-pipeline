@@ -47,10 +47,12 @@ src/
     session-routes.ts secure browser cookie boundary
     authentication.ts authentication middleware wiring
     authorization.ts role and scope policy
-    user-batching.ts  Effect Request/RequestResolver lookup cache
+    lookups.ts        true bulk user RequestResolver and request cache
     layers.ts          application composition and HTTP/WebSocket routes
   client/
     blog-client.ts    screen-oriented queries and HTTP/WebSocket client Layers
+  test-support/
+    query-complexity.ts SQL span collection and constant-work assertions
   web/
     model.ts          serializable Foldkit model
     message.ts        facts emitted by the UI and commands
@@ -99,7 +101,7 @@ return Pipeline.all({
   comments: Pipeline.map(rpc.listComments({ postId: post.id }), (comment) => ({
     comment,
     author: rpc.getUser({ id: comment.authorId }),
-    canDelete: rpc.canDeleteComment({ commentId: comment.id })
+    canDelete: rpc.canDeleteComment({ authorId: comment.authorId })
   })),
   viewerUpvoted: rpc.hasUpvoted({ postId: post.id }),
   viewer: rpc.me()
@@ -125,7 +127,7 @@ yield* PipelineSql.afterCommit(events.publish({
 
 The server also demonstrates:
 
-- `Request` and `RequestResolver` caching for repeated user hydration;
+- `Request` and `RequestResolver` caching backed by a real SQL `IN (...)` loader for user hydration;
 - selective SQL transactions around pipelines containing mutations;
 - authentication coverage checks and a typed `CurrentUser` service;
 - role/scope authorization inside handlers;
@@ -149,5 +151,9 @@ npm run build
 ```
 
 `src/blog.e2e.test.ts` starts a real Effect Node server on an ephemeral port and covers HTTP, WebSocket, SQLite, secure refresh cookies, JWT rotation and replay rejection, logout revocation, same-origin enforcement, authorization boundaries, authoring, moderation, pipelines, streams, capabilities, and callbacks. `src/ssr.e2e.test.ts` creates real SQLite data, loads it through the in-process client, and verifies the rendered Foldkit article and not-found pages. `src/web/application.scene.test.ts` tests Foldkit scenes and pure update stories.
+
+`src/query-complexity.test.ts` guards against database N+1 regressions without adding test hooks to application code. A test tracer observes the native `sql.execute` spans emitted by Effect SQL, normalizes their statements into fingerprints, and compares every client workflow at 2, 16, and 100 related rows. Reads and writes must remain exactly constant and stay within an explicit ceiling. A synthetic self-test proves that the assertion rejects a repeated per-row query while accepting one bulk `IN (...)` query.
+
+Coverage is discovered rather than maintained in a second RPC registry. The test compares observed server span tags with `AppRpcs.requests` and proxies the `BlogClient` facade to record invoked methods. Adding an RPC or client workflow makes the suite fail until a scaling scenario exercises it. The same coverage run starts a real WebSocket server for the stream and callback boundaries, which cannot be represented by the finite in-process pipeline client.
 
 Known integration gaps and package findings are tracked in [PACKAGE_AUDIT.md](./PACKAGE_AUDIT.md).

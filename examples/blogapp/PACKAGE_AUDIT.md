@@ -12,9 +12,13 @@ Pipeline expressions preserved `Option.none()` and `Option.some(...)`, but an RP
 
 Individual handlers returned decoded `Schema.Class` values. The aggregate pipeline RPC has an unknown JSON response, and Effect's JSON codec correctly rejected custom prototypes. The server now converts final results and typed failures to plain transport objects while preserving tagged Options for client revival. The blog's HTTP and WebSocket tests cover class-heavy results.
 
-### Request batching cache creation must happen inside the request scope
+### Request batching must reach a true bulk database operation
 
-`RequestBatching.cache` requires the package `RequestScope`. Constructing the cache while building a handler layer fails because that scope exists only during pipeline execution. The example keeps the resolver application-scoped but creates/retrieves its cache lazily inside `getUser`.
+The first resolver implementation accepted a batch but then called `database.getUser` once for every entry. It also constructed `RequestBatching.cache` inside the lookup function, which gave each item a different cache descriptor. Both patterns preserve RPC batching while still producing N SQL statements. `BlogLookups` now owns a stable request-cache Effect and its user resolver calls `getUsers`, implemented as one SQL `IN (...)` query. Authentication, `me`, feed author hydration, and comment author hydration reuse this request-scoped cache. Comment ownership uses the `authorId` already present in the pipeline value, so it does not perform a redundant lookup at all.
+
+The resulting query count is bounded by dependency phases rather than result size. A feed performs one post-list query plus bulk author lookup queries for the phases that introduce new IDs. An article performs fixed post, comment-list, and vote queries plus bulk user lookups. Adding more posts or comments increases rows returned, not the number of SQL statements. A focused lookup test asserts that duplicates and sequential cache hits still produce exactly one bulk database call per entity batch.
+
+The server's execution concurrency matches its `maxMapItems` limit so every allowed mapped lookup can enter the same resolver batch; a smaller concurrency window would make very large maps split into additional SQL batches. `query-complexity.test.ts` verifies the whole configured range with native Effect SQL spans at 2, 16, and 100 related rows. It also compares runtime RPC and facade-method coverage against the actual definitions, so a newly added boundary or client workflow cannot silently bypass the scaling suite. This instrumentation exists only in test code.
 
 ## Ergonomic gaps addressed after the first application pass
 

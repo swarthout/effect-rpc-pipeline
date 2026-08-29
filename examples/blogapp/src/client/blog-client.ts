@@ -58,7 +58,7 @@ export const makeFacade = (rpc: AppClient) => ({
       post,
       author: rpc.getUser({ id: post.authorId }),
       comments: Pipeline.map(rpc.listComments({ postId: post.id }), (comment) => ({
-        comment, author: rpc.getUser({ id: comment.authorId }), canDelete: rpc.canDeleteComment({ commentId: comment.id })
+        comment, author: rpc.getUser({ id: comment.authorId }), canDelete: rpc.canDeleteComment({ authorId: comment.authorId })
       })),
       viewerUpvoted: rpc.hasUpvoted({ postId: post.id }),
       viewer: rpc.me()

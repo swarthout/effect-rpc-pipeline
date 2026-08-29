@@ -31,6 +31,7 @@ export class BlogDatabase extends Context.Service<BlogDatabase, {
   readonly createUser: (input: { readonly username: string; readonly displayName: string; readonly passwordHash: string; readonly role?: Role }) => Effect.Effect<User, Conflict>
   readonly findUserByUsername: (username: string) => Effect.Effect<{ readonly user: User; readonly passwordHash: string }, NotFound>
   readonly getUser: (id: string) => Effect.Effect<User, NotFound>
+  readonly getUsers: (ids: ReadonlyArray<string>) => Effect.Effect<ReadonlyArray<User>>
   readonly listUsers: Effect.Effect<ReadonlyArray<User>>
   readonly updateUser: (id: string, fields: { readonly role?: Role; readonly isSuspended?: boolean }) => Effect.Effect<User, NotFound>
   readonly saveRefreshToken: (input: { readonly digest: string; readonly family: string; readonly userId: string; readonly expiresAt: number }) => Effect.Effect<void>
@@ -99,6 +100,11 @@ export const BlogDatabaseLive = Layer.effect(BlogDatabase, Effect.gen(function*(
   const getUser = Effect.fn("BlogDatabase.getUser")(function*(id: string) {
     return yield* firstOrNotFound((yield* query<UserRow>`SELECT * FROM users WHERE id = ${id}`).map(toUser), "User", id)
   })
+  const getUsers = Effect.fn("BlogDatabase.getUsers")(function*(ids: ReadonlyArray<string>) {
+    const uniqueIds = [...new Set(ids)]
+    if (uniqueIds.length === 0) return []
+    return (yield* query<UserRow>`SELECT * FROM users WHERE id IN ${sql.in(uniqueIds)}`).map(toUser)
+  })
   const getPostById = Effect.fn("BlogDatabase.getPostById")(function*(id: string) {
     const rows = yield* query<PostRow>`SELECT p.*, COUNT(DISTINCT v.user_id) AS upvotes, COUNT(DISTINCT c.id) AS comment_count
       FROM posts p LEFT JOIN votes v ON v.post_id = p.id LEFT JOIN comments c ON c.post_id = p.id
@@ -163,6 +169,7 @@ export const BlogDatabaseLive = Layer.effect(BlogDatabase, Effect.gen(function*(
       return { user: toUser(row), passwordHash: row.password_hash }
     }),
     getUser,
+    getUsers,
     listUsers,
     updateUser,
     saveRefreshToken: (input) => query`INSERT INTO refresh_tokens (digest, family, user_id, expires_at) VALUES (${input.digest}, ${input.family}, ${input.userId}, ${input.expiresAt})`.pipe(Effect.asVoid, Effect.orDie),

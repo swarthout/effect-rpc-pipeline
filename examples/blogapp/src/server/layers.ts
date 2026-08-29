@@ -15,6 +15,7 @@ import { makeApplicationLayer, makeTokenServiceLayer } from "./handlers/applicat
 import { hashPassword } from "./security.js"
 import { SessionRoutesLive } from "./session-routes.js"
 import { SessionServiceLive } from "./sessions.js"
+import { BlogLookupsLive } from "./lookups.js"
 import { AppPipelineClient, AuthenticatedClientLive, BlogClient, type BlogClientApi, makeFacade } from "../client/blog-client.js"
 
 const publicRpcs = [HealthRpc, RegisterRpc, LoginRpc, RefreshRpc, ListPostsRpc, GetPostRpc, GetUserRpc, ListCommentsRpc, WatchPostRpc] as const
@@ -36,6 +37,7 @@ export const makeBlogLayers = (filename: string) => {
   const DatabaseLive = BlogDatabaseLive.pipe(Layer.provide(SqlLive))
   const TokenLive = makeTokenServiceLayer()
   const BaseLive = Layer.merge(DatabaseLive, TokenLive)
+  const LookupsLive = BlogLookupsLive.pipe(Layer.provide(DatabaseLive))
   const SessionsLive = SessionServiceLive.pipe(Layer.provide(BaseLive))
 
   const InitializeLive = Layer.effectDiscard(Effect.gen(function*() {
@@ -53,7 +55,7 @@ export const makeBlogLayers = (filename: string) => {
     const changes = yield* PubSub.unbounded<BlogEvent>()
     const handlers = yield* makeApplicationLayer(changes)
     return Layer.mergeAll(handlers, makeAuthLayers)
-  })).pipe(Layer.provide(SessionsLive), Layer.provide(BaseLive))
+  })).pipe(Layer.provide(LookupsLive), Layer.provide(SessionsLive), Layer.provide(BaseLive))
 
   const telemetry = PipelineTelemetry.make({ tracing: { invocations: true, spanPrefix: "BlogRpc" }, metrics: { prefix: "blog_rpc" } })
   const transaction = PipelineSql.transaction({ when: (context) => context.rpcTags.some((tag) => mutationTags.has(tag)) })
@@ -64,14 +66,14 @@ export const makeBlogLayers = (filename: string) => {
       path: "/rpc",
       id: "pipeline-press",
       middleware: pipelineMiddleware,
-      limits: { maxNodes: 250, maxMapItems: 100, maxInvocations: 500, concurrency: 32 }
+      limits: { maxNodes: 250, maxMapItems: 100, maxInvocations: 500, concurrency: 100 }
     }),
     PipelineServer.layerWebSocket({
       group: AppRpcs,
       path: "/rpc",
       id: "pipeline-press",
       middleware: pipelineMiddleware,
-      limits: { maxNodes: 250, maxMapItems: 100, maxInvocations: 500, concurrency: 32 }
+      limits: { maxNodes: 250, maxMapItems: 100, maxInvocations: 500, concurrency: 100 }
     })
   ).pipe(
     Layer.provide(ServicesLive),
@@ -88,11 +90,11 @@ export const makeBlogLayers = (filename: string) => {
   const InProcessPipelineLive = PipelineClient.layerClientInProcess(AppPipelineClient, AppRpcs, {
     id: "pipeline-press",
     middleware: pipelineMiddleware,
-    limits: { maxNodes: 250, maxMapItems: 100, maxInvocations: 500, concurrency: 32 }
+    limits: { maxNodes: 250, maxMapItems: 100, maxInvocations: 500, concurrency: 100 }
   }).pipe(
     Layer.provide(AuthenticatedClientLive),
     Layer.provide(ServicesLive),
-    Layer.provide(makeAuthLayers.pipe(Layer.provide(BaseLive))),
+    Layer.provide(makeAuthLayers.pipe(Layer.provide(LookupsLive), Layer.provide(BaseLive))),
     Layer.provide(BaseLive),
     Layer.provide(SqlLive)
   )
@@ -106,6 +108,7 @@ export const makeBlogLayers = (filename: string) => {
     InProcessClientLive: Layer.merge(InProcessClientLive, InitializeLive),
     BaseLive,
     SessionsLive,
+    LookupsLive,
     InitializeLive
   }
 }

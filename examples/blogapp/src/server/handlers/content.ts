@@ -5,6 +5,7 @@ import {
 } from "../../shared/contracts.js"
 import { requireScope } from "../authorization.js"
 import { BlogDatabase } from "../database.js"
+import { BlogLookups } from "../lookups.js"
 
 type EventPublisher = ReturnType<typeof import("../events.js").makeEvents>
 type PostInput = { readonly title: string; readonly excerpt: string; readonly body: string; readonly tags: ReadonlyArray<string>; readonly status: PostStatus }
@@ -12,13 +13,14 @@ type NotificationSinkInstance = typeof NotificationSink.schema.Type
 
 export const makeContentHandlers = Effect.fn("makeContentHandlers")(function*(events: EventPublisher) {
   const database = yield* BlogDatabase
+  const lookups = yield* BlogLookups
   const canManagePost = Effect.fn("canManagePost")(function*(principal: Principal, postId: string) {
     const post = yield* database.getPostById(postId)
     if (post.authorId !== principal.id && principal.role !== "Admin") return yield* new Forbidden({ action: "manage post" })
     return post
   })
   return {
-    me: () => Effect.flatMap(CurrentUser, (principal) => database.getUser(principal.id)),
+    me: () => Effect.flatMap(CurrentUser, (principal) => lookups.userById(principal.id)),
     myPosts: () => Effect.flatMap(CurrentUser, (principal) => database.listPostsByAuthor(principal.id)),
     createPost: (input: PostInput) => Effect.gen(function*() {
       const principal = yield* CurrentUser; yield* requireScope(principal, "posts:write", "create post")
@@ -56,9 +58,9 @@ export const makeContentHandlers = Effect.fn("makeContentHandlers")(function*(ev
       return upvoted
     }),
     hasUpvoted: ({ postId }: { postId: string }) => Effect.flatMap(CurrentUser, (principal) => database.hasUpvoted(postId, principal.id)),
-    canDeleteComment: ({ commentId }: { commentId: string }) => Effect.gen(function*() {
-      const principal = yield* CurrentUser; const comment = yield* database.getComment(commentId)
-      return comment.authorId === principal.id || principal.role === "Admin"
+    canDeleteComment: ({ authorId }: { authorId: string }) => Effect.gen(function*() {
+      const principal = yield* CurrentUser
+      return authorId === principal.id || principal.role === "Admin"
     }),
     openAuthorSession: ({ postId }: { postId: string }) => Effect.gen(function*() {
       const principal = yield* CurrentUser; yield* canManagePost(principal, postId)
