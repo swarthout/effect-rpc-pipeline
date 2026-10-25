@@ -3,7 +3,7 @@ import * as Context from "effect/Context"
 import * as Effect from "effect/Effect"
 import * as Layer from "effect/Layer"
 import * as Option from "effect/Option"
-import * as SqlClient from "effect/unstable/sql/SqlClient"
+import * as SqlClient from "effect/sql/SqlClient"
 import { AdminSummary, Comment, Conflict, InvalidInput, NotFound, Post, type PostStatus, User, type Role } from "../shared/contracts.js"
 
 type UserRow = { id: string; username: string; display_name: string; bio: string; role: Role; is_suspended: number; password_hash: string; created_at: number }
@@ -145,7 +145,8 @@ export const BlogDatabaseLive = Layer.effect(BlogDatabase, Effect.gen(function*(
     return yield* getPostById(id)
   })
   const listComments = Effect.fn("BlogDatabase.listComments")(function*(postId: string) {
-    return (yield* query<CommentRow>`SELECT * FROM comments WHERE post_id = ${postId} ORDER BY created_at`).map(toComment)
+    return (yield* query<CommentRow>`SELECT c.* FROM comments c JOIN posts p ON p.id = c.post_id
+      WHERE c.post_id = ${postId} AND p.status = 'Published' ORDER BY c.created_at`).map(toComment)
   })
   const deleteComment = Effect.fn("BlogDatabase.deleteComment")(function*(id: string) {
     yield* firstOrNotFound(yield* query`SELECT id FROM comments WHERE id = ${id}`, "Comment", id)
@@ -174,11 +175,13 @@ export const BlogDatabaseLive = Layer.effect(BlogDatabase, Effect.gen(function*(
     updateUser,
     saveRefreshToken: (input) => query`INSERT INTO refresh_tokens (digest, family, user_id, expires_at) VALUES (${input.digest}, ${input.family}, ${input.userId}, ${input.expiresAt})`.pipe(Effect.asVoid, Effect.orDie),
     rotateRefreshToken: Effect.fn("BlogDatabase.rotateRefreshToken")(function*(oldDigest, next) {
-      const rows = yield* query<{ digest: string }>`SELECT digest FROM refresh_tokens WHERE digest = ${oldDigest} AND used_at IS NULL AND expires_at > ${Date.now()}`
-      if (rows.length === 0) return yield* new NotFound({ resource: "RefreshToken", id: oldDigest })
-      yield* query`UPDATE refresh_tokens SET used_at = ${Date.now()} WHERE digest = ${oldDigest}`
-      yield* query`INSERT INTO refresh_tokens (digest, family, user_id, expires_at) VALUES (${next.digest}, ${next.family}, ${next.userId}, ${next.expiresAt})`
-      return undefined
+      return yield* sql.withTransaction(Effect.gen(function*() {
+        const rows = yield* query<{ digest: string }>`UPDATE refresh_tokens SET used_at = ${Date.now()}
+          WHERE digest = ${oldDigest} AND used_at IS NULL AND expires_at > ${Date.now()}
+          AND family = ${next.family} AND user_id = ${next.userId} RETURNING digest`
+        if (rows.length === 0) return yield* new NotFound({ resource: "RefreshToken", id: "unavailable" })
+        yield* query`INSERT INTO refresh_tokens (digest, family, user_id, expires_at) VALUES (${next.digest}, ${next.family}, ${next.userId}, ${next.expiresAt})`
+      })).pipe(Effect.catch((error) => error instanceof NotFound ? Effect.fail(error) : Effect.die(error)))
     }),
     revokeRefreshToken: (digest) => query`UPDATE refresh_tokens SET used_at = ${Date.now()} WHERE digest = ${digest} AND used_at IS NULL`.pipe(Effect.asVoid, Effect.orDie),
     createPost,

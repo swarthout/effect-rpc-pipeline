@@ -3,7 +3,7 @@ import * as PipelineSql from "effect-rpc-pipeline/Sql"
 import {
   AuthorSession, CurrentUser, Forbidden, NotificationSink, type PostStatus, type Principal
 } from "../../shared/contracts.js"
-import { requireScope } from "../authorization.js"
+import { principalFor, requireScope } from "../authorization.js"
 import { BlogDatabase } from "../database.js"
 import { BlogLookups } from "../lookups.js"
 
@@ -18,6 +18,12 @@ export const makeContentHandlers = Effect.fn("makeContentHandlers")(function*(ev
     const post = yield* database.getPostById(postId)
     if (post.authorId !== principal.id && principal.role !== "Admin") return yield* new Forbidden({ action: "manage post" })
     return post
+  })
+  const canReadPost = Effect.fn("canReadPost")(function*(principal: Principal, postId: string) {
+    const post = yield* database.getPostById(postId)
+    if (post.status !== "Published" && post.authorId !== principal.id && principal.role !== "Admin") {
+      return yield* new Forbidden({ action: "interact with a private draft" })
+    }
   })
   return {
     me: () => Effect.flatMap(CurrentUser, (principal) => lookups.userById(principal.id)),
@@ -41,6 +47,7 @@ export const makeContentHandlers = Effect.fn("makeContentHandlers")(function*(ev
     }),
     addComment: ({ postId, body }: { postId: string; body: string }) => Effect.gen(function*() {
       const principal = yield* CurrentUser; yield* requireScope(principal, "comments:write", "comment")
+      yield* canReadPost(principal, postId)
       const comment = yield* database.createComment(postId, principal.id, body)
       yield* PipelineSql.afterCommit(events.publish("CommentAdded", postId, `${principal.username} commented`))
       return comment
@@ -53,6 +60,7 @@ export const makeContentHandlers = Effect.fn("makeContentHandlers")(function*(ev
     }),
     toggleUpvote: ({ postId }: { postId: string }) => Effect.gen(function*() {
       const principal = yield* CurrentUser; yield* requireScope(principal, "votes:write", "upvote")
+      yield* canReadPost(principal, postId)
       const upvoted = yield* database.toggleVote(postId, principal.id)
       yield* PipelineSql.afterCommit(events.publish("VoteChanged", postId, `${principal.username} ${upvoted ? "upvoted" : "removed an upvote"}`))
       return upvoted
@@ -66,17 +74,27 @@ export const makeContentHandlers = Effect.fn("makeContentHandlers")(function*(ev
       const principal = yield* CurrentUser; yield* canManagePost(principal, postId)
       return yield* AuthorSession.fromHandlers({
         save: (input) => Effect.gen(function*() {
-          yield* canManagePost(principal, postId); const current = yield* database.getPostById(postId)
+          const user = yield* database.getUser(principal.id)
+          if (user.isSuspended) return yield* new Forbidden({ action: "use author session while suspended" })
+          const currentPrincipal = principalFor(user)
+          yield* requireScope(currentPrincipal, "posts:write", "save post")
+          yield* canManagePost(currentPrincipal, postId); const current = yield* database.getPostById(postId)
           const post = yield* database.updatePost(postId, { ...input, status: current.status })
           yield* events.publish("PostChanged", postId, `${principal.username} saved ${post.title}`); return post
         }),
         publish: () => Effect.gen(function*() {
-          yield* canManagePost(principal, postId); const current = yield* database.getPostById(postId)
+          const user = yield* database.getUser(principal.id)
+          if (user.isSuspended) return yield* new Forbidden({ action: "use author session while suspended" })
+          const currentPrincipal = principalFor(user)
+          yield* requireScope(currentPrincipal, "posts:write", "publish post")
+          yield* canManagePost(currentPrincipal, postId); const current = yield* database.getPostById(postId)
           const post = yield* database.updatePost(postId, { ...current, status: "Published" })
           yield* events.publish("PostChanged", postId, `${principal.username} published ${post.title}`); return post
         }),
         remove: () => Effect.gen(function*() {
-          yield* canManagePost(principal, postId); const removed = yield* database.deletePost(postId)
+          const user = yield* database.getUser(principal.id)
+          if (user.isSuspended) return yield* new Forbidden({ action: "use author session while suspended" })
+          yield* canManagePost(principalFor(user), postId); const removed = yield* database.deletePost(postId)
           yield* events.publish("Moderated", postId, `${principal.username} deleted a post`); return removed
         })
       })

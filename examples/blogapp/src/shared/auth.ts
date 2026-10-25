@@ -2,7 +2,7 @@ import * as Context from "effect/Context"
 import type * as Effect from "effect/Effect"
 import * as Redacted from "effect/Redacted"
 import * as Schema from "effect/Schema"
-import * as RpcMiddleware from "effect/unstable/rpc/RpcMiddleware"
+import * as RpcMiddleware from "effect/rpc/RpcMiddleware"
 import { Suspended, Unauthorized } from "./errors.js"
 import type { Role } from "./models.js"
 

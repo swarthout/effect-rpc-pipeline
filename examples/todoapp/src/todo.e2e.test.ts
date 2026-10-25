@@ -4,10 +4,10 @@ import * as Effect from "effect/Effect"
 import * as Layer from "effect/Layer"
 import * as Queue from "effect/Queue"
 import * as Stream from "effect/Stream"
-import * as RpcSerialization from "effect/unstable/rpc/RpcSerialization"
-import * as Socket from "effect/unstable/socket/Socket"
-import * as HttpRouter from "effect/unstable/http/HttpRouter"
-import * as HttpServer from "effect/unstable/http/HttpServer"
+import * as RpcSerialization from "effect/rpc/RpcSerialization"
+import * as Socket from "effect/socket/Socket"
+import * as HttpRouter from "effect/http/HttpRouter"
+import * as HttpServer from "effect/http/HttpServer"
 import * as PipelineClient from "effect-rpc-pipeline/PipelineClient"
 import { afterAll, beforeAll, describe, expect, it } from "vitest"
 import { createServer } from "node:http"
@@ -121,7 +121,7 @@ describe("TodoMVC end-to-end", () => {
       )
       const serverContext = yield* Layer.build(ServerLive as Layer.Layer<HttpServer.HttpServer, unknown>)
       const liveServer = Context.get(serverContext, HttpServer.HttpServer)
-      if (liveServer.address._tag !== "TcpAddress") return yield* Effect.die("Expected TCP test server")
+      if (liveServer.address._tag === "UnixPathAddress") return yield* Effect.die("Expected TCP test server")
       const url = `ws://127.0.0.1:${liveServer.address.port}/rpc`
       const token = yield* Effect.promise(() => makeAccessToken({ id: "user-1", name: "Ada" }))
 

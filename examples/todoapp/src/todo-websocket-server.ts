@@ -1,7 +1,7 @@
 import { NodeHttpServer, NodeRuntime } from "@effect/platform-node"
 import * as Layer from "effect/Layer"
-import * as HttpRouter from "effect/unstable/http/HttpRouter"
-import * as RpcSerialization from "effect/unstable/rpc/RpcSerialization"
+import * as HttpRouter from "effect/http/HttpRouter"
+import * as RpcSerialization from "effect/rpc/RpcSerialization"
 import { createServer } from "node:http"
 import { TodoLiveRoutes } from "./todo-live.js"
 

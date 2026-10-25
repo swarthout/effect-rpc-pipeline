@@ -4,10 +4,10 @@ Pipeline Press is a full-stack blog application that exercises `effect-rpc-pipel
 
 ## Run it
 
-Install from this directory, then start the API and web app in separate terminals:
+Use Node.js 24.11+ (24.x) or 26+. From the repository root, run `npm ci` and `npm run build`. Then install from this directory and start the API and web app in separate terminals:
 
 ```sh
-npm install
+npm ci
 npm run dev:server
 ```
 
@@ -18,6 +18,12 @@ npm run dev
 Open `http://localhost:5174`. The development administrator is `admin` with password `admin-password-change-me`. The SQLite database is stored in `.data/blog.db` and is ignored by Git.
 
 The local package uses npm's `install-links=true` setting so the `file:../..` dependency is installed like a real package and shares the example's Effect runtime.
+
+After changing the library, rebuild it at the repository root and run `npm ci` here to refresh the copied package. The example overrides Foldkit 0.169.0's exact Effect 4.0.0 peer declarations to use the tested 4.0.6 platform/SQL ecosystem. These overrides are explicit and are exercised by the example tests. Restart the dev processes after changing capability definitions: definition identifiers must be registered only once within a module registry.
+
+The Vite proxy preserves the original Host for same-origin session checks and forwards WebSocket upgrades. Keep the frontend on the documented port; `strictPort` prevents silently selecting another origin.
+
+For deployment, set `NODE_ENV=production`, a random `BLOG_JWT_SECRET` of at least 32 bytes, and an HTTPS `BLOG_PUBLIC_ORIGIN` such as `https://blog.example.com`. The first database initialization also requires `BLOG_ADMIN_PASSWORD` with at least 16 characters; it creates `admin` only when that user is absent. Changing that variable does not change an existing user's password. Route `/session` and `/rpc` through the configured public origin and terminate TLS at your application host or trusted proxy. Production startup rejects missing configuration. Do not deploy the Vite development server as the production host.
 
 ## What the application supports
 
@@ -66,12 +72,9 @@ src/
 The Foldkit runtime depends on `BlogClient` as an Effect service. `layerHttpClient()` constructs the facade once and each finite pipeline execution owns its internal request scope. Commands simply yield the service:
 
 ```ts
-const LoadFeed = Command.make("LoadFeed", (input: FeedInput) =>
-  Effect.gen(function*() {
-    const blog = yield* BlogClient
-    return yield* blog.feed(input.search)
-  })
-)
+// Inside a Command.define execute callback:
+const blog = yield* BlogClient
+const posts = yield* blog.feed(input.search)
 ```
 
 `layerWebSocketClient()` instead owns one connection for the Layer scope, which lets streams and capabilities persist across calls without exposing `Scope` throughout application code.
@@ -152,8 +155,16 @@ npm run build
 
 `src/blog.e2e.test.ts` starts a real Effect Node server on an ephemeral port and covers HTTP, WebSocket, SQLite, secure refresh cookies, JWT rotation and replay rejection, logout revocation, same-origin enforcement, authorization boundaries, authoring, moderation, pipelines, streams, capabilities, and callbacks. `src/ssr.e2e.test.ts` creates real SQLite data, loads it through the in-process client, and verifies the rendered Foldkit article and not-found pages. `src/web/application.scene.test.ts` tests Foldkit scenes and pure update stories.
 
-`src/query-complexity.test.ts` guards against database N+1 regressions without adding test hooks to application code. A test tracer observes the native `sql.execute` spans emitted by Effect SQL, normalizes their statements into fingerprints, and compares every client workflow at 2, 16, and 100 related rows. Reads and writes must remain exactly constant and stay within an explicit ceiling. A synthetic self-test proves that the assertion rejects a repeated per-row query while accepting one bulk `IN (...)` query.
+`src/query-complexity.test.ts` guards against database N+1 regressions without adding test hooks to application code. A test tracer observes `db.query.text` on native Effect SQL spans and `rpc.method` on RPC spans, normalizes statements into fingerprints, and compares every client workflow at 2, 16, and 100 related rows. Reads and writes must remain exactly constant and stay within an explicit ceiling. The example sets global concurrency to the graph's 500-invocation budget so maps with multiple calls per item can enter the same resolver batch. A synthetic self-test proves that the assertion rejects a repeated per-row query while accepting one bulk `IN (...)` query.
 
 Coverage is discovered rather than maintained in a second RPC registry. The test compares observed server span tags with `AppRpcs.requests` and proxies the `BlogClient` facade to record invoked methods. Adding an RPC or client workflow makes the suite fail until a scaling scenario exercises it. The same coverage run starts a real WebSocket server for the stream and callback boundaries, which cannot be represented by the finite in-process pipeline client.
 
 Known integration gaps and package findings are tracked in [PACKAGE_AUDIT.md](./PACKAGE_AUDIT.md).
+
+## Example boundaries
+
+This application demonstrates integration patterns; it is not a complete deployment template. UI navigation changes the Model without implementing browser history. Direct `/posts/<slug>` URLs support SSR, and missing article responses use HTTP 404. Session restoration refreshes credentials on startup; automatic refresh before access-token expiry is not implemented. Reload or sign in again after expiration. The demo's refresh cookie is Secure and requires HTTPS in production; browsers treat localhost development specially.
+
+Foldkit DevTools is enabled only in development and can inspect form state and tokens. Use demonstration credentials while debugging. Whole-Model slow-phase logging is disabled to keep credential fields out of those diagnostics.
+
+Author capabilities recheck current suspension, roles and ownership. Public comment queries and post events exclude drafts. Post streams emit events only while the post currently exists and is published; deletion notifications and durable event replay are not provided. Application hosts still need deliberate rate limits, database backups, TLS, and proxy/origin configuration.

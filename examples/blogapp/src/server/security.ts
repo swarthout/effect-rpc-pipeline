@@ -44,7 +44,11 @@ export class TokenService extends Context.Service<TokenService, {
   readonly verifyRefresh: (token: string) => Effect.Effect<{ readonly userId: string; readonly family: string }, Unauthorized>
 }>()("blog/TokenService") {}
 
-export const makeTokenServiceLayer = (secret = "pipeline-press-development-secret-at-least-32-bytes") => Layer.effect(
+export const makeTokenServiceLayer = (secret = process.env.BLOG_JWT_SECRET ?? "pipeline-press-development-secret-at-least-32-bytes") => {
+  if (process.env.NODE_ENV === "production" && (process.env.BLOG_JWT_SECRET === undefined || new TextEncoder().encode(secret).length < 32)) {
+    throw new Error("Production requires BLOG_JWT_SECRET with at least 32 bytes")
+  }
+  return Layer.effect(
   TokenService,
   Effect.gen(function*() {
     const key = new TextEncoder().encode(secret)
@@ -99,3 +103,4 @@ export const makeTokenServiceLayer = (secret = "pipeline-press-development-secre
     return TokenService.of({ issueAccess, issueRefresh, verifyAccess, verifyRefresh })
   })
 )
+}

@@ -8,9 +8,9 @@ import * as Queue from "effect/Queue"
 import * as Schema from "effect/Schema"
 import type * as Scope from "effect/Scope"
 import * as Stream from "effect/Stream"
-import * as Rpc from "effect/unstable/rpc/Rpc"
-import * as RpcClient from "effect/unstable/rpc/RpcClient"
-import * as RpcGroup from "effect/unstable/rpc/RpcGroup"
+import * as Rpc from "effect/rpc/Rpc"
+import * as RpcClient from "effect/rpc/RpcClient"
+import * as RpcGroup from "effect/rpc/RpcGroup"
 import type { CapabilityInstance, CapabilityRef } from "./Capability.js"
 import * as Capability from "./Capability.js"
 import { PeerCalls } from "./ExecutionPolicy.js"
@@ -120,11 +120,12 @@ export const makeServer = Effect.sync((): ServerService => {
   const sessionsByClient = new Map<number, Session>()
 
   const close = (session: Session) => {
-    sessionsById.delete(session.id)
+    if (sessionsById.get(session.id) === session) sessionsById.delete(session.id)
     if (sessionsByClient.get(session.clientId) === session) sessionsByClient.delete(session.clientId)
     for (const deferred of session.pending.values()) Deferred.doneUnsafe(deferred, Effect.fail(new Capability.CapabilityTransportError({ reason: "Connection closed", capabilityId: "connection" })))
     session.pending.clear()
     session.serverCapabilities.clear()
+    Queue.endUnsafe(session.queue)
   }
 
   return {
@@ -133,7 +134,7 @@ export const makeServer = Effect.sync((): ServerService => {
       if (previous !== undefined) return yield* Effect.fail(new DuplexError({ reason: "Duplex session is already open" }))
       const previousForClient = sessionsByClient.get(clientId)
       if (previousForClient !== undefined) close(previousForClient)
-      const queue = yield* Queue.make<SessionEvent, Cause.Done>()
+      const queue = yield* Queue.bounded<SessionEvent, Cause.Done>(1000)
       const session: Session = { id: sessionId, clientId, queue, pending: new Map(), serverCapabilities: new Map(), nextCallId: 0 }
       sessionsById.set(sessionId, session)
       sessionsByClient.set(clientId, session)
@@ -161,10 +162,11 @@ export const makeServer = Effect.sync((): ServerService => {
       const session = sessionsByClient.get(clientId)
       if (session === undefined) return yield* Effect.fail(new Capability.CapabilityTransportError({ reason: "WebSocket duplex session is not available", capabilityId: ref.capabilityId }))
       if (ref.owner !== "client") return yield* Effect.fail(new Capability.CapabilityTransportError({ reason: "Invalid capability owner", capabilityId: ref.capabilityId }))
+      if (session.pending.size >= 1000) return yield* Effect.fail(new Capability.CapabilityTransportError({ reason: "Pending callback limit exceeded", capabilityId: ref.capabilityId }))
       const callId = `${session.id}:${session.nextCallId++}`
       const deferred = yield* Deferred.make<unknown, unknown>()
       session.pending.set(callId, deferred)
-      yield* Queue.offer(session.queue, {
+      const queued = Queue.offerUnsafe(session.queue, {
         _tag: "Invoke",
         callId,
         definitionId: ref.definitionId,
@@ -172,8 +174,12 @@ export const makeServer = Effect.sync((): ServerService => {
         method,
         ...(payload === undefined ? {} : { payload })
       })
+      if (!queued) {
+        session.pending.delete(callId)
+        return yield* Effect.fail(new Capability.CapabilityTransportError({ reason: "Callback event queue limit exceeded", capabilityId: ref.capabilityId }))
+      }
       return yield* Deferred.await(deferred).pipe(
-        Effect.onInterrupt(() => Queue.offer(session.queue, { _tag: "Cancel", callId })),
+        Effect.onInterrupt(() => Effect.sync(() => { Queue.offerUnsafe(session.queue, { _tag: "Cancel", callId }) })),
         Effect.ensuring(Effect.sync(() => session.pending.delete(callId)))
       )
     }),
@@ -181,6 +187,7 @@ export const makeServer = Effect.sync((): ServerService => {
       const session = sessionsByClient.get(clientId)
       if (session === undefined) throw new DuplexError({ reason: "Persistent capabilities require a WebSocket duplex session", capabilityId: instance.capabilityId })
       if (instance.owner !== "local") throw new DuplexError({ reason: "Cannot register a peer-owned capability", capabilityId: instance.capabilityId })
+      if (!session.serverCapabilities.has(instance.capabilityId) && session.serverCapabilities.size >= 1000) throw new DuplexError({ reason: "Server capability limit exceeded", capabilityId: instance.capabilityId })
       session.serverCapabilities.set(instance.capabilityId, instance)
       return Capability.toRef(instance, "server")
     },
@@ -294,6 +301,12 @@ export const makeClientSession = (
       Deferred.doneUnsafe(ready, Effect.fail(new DuplexError({ reason: Cause.pretty(cause), sessionId })))
       return Effect.void
     }),
+    Effect.ensuring(Effect.gen(function*() {
+      Deferred.doneUnsafe(ready, Effect.fail(new DuplexError({ reason: "Duplex session closed before readiness", sessionId })))
+      yield* Effect.forEach([...invocations.values()], Fiber.interrupt, { concurrency: "unbounded", discard: true })
+      invocations.clear()
+      localCapabilities.clear()
+    })),
     Effect.forkScoped
   )
 
@@ -319,7 +332,10 @@ export const makeClientSession = (
 
   return {
     sessionId,
-    ready: Deferred.await(ready),
+    ready: Deferred.await(ready).pipe(
+      Effect.timeout("10 seconds"),
+      Effect.mapError((error) => error instanceof DuplexError ? error : new DuplexError({ reason: "Duplex handshake timed out", sessionId }))
+    ),
     encodeLiteral(value) {
       if (!Capability.isInstance(value)) return value
       if (value.owner === "local") localCapabilities.set(value.capabilityId, value)

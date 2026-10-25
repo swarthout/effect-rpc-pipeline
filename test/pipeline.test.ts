@@ -1,20 +1,23 @@
 import * as Cache from "effect/Cache"
 import * as Context from "effect/Context"
+import * as Cause from "effect/Cause"
+import * as Deferred from "effect/Deferred"
 import * as Effect from "effect/Effect"
 import * as Exit from "effect/Exit"
+import * as Fiber from "effect/Fiber"
 import * as Layer from "effect/Layer"
 import * as Option from "effect/Option"
 import * as Request from "effect/Request"
 import * as RequestResolver from "effect/RequestResolver"
 import * as Schema from "effect/Schema"
-import * as Headers from "effect/unstable/http/Headers"
-import * as Rpc from "effect/unstable/rpc/Rpc"
-import * as RpcClient from "effect/unstable/rpc/RpcClient"
-import type { RpcClientError } from "effect/unstable/rpc/RpcClientError"
-import * as RpcGroup from "effect/unstable/rpc/RpcGroup"
-import * as RpcMiddleware from "effect/unstable/rpc/RpcMiddleware"
-import * as SqlClient from "effect/unstable/sql/SqlClient"
-import * as SqlError from "effect/unstable/sql/SqlError"
+import * as Headers from "effect/http/Headers"
+import * as Rpc from "effect/rpc/Rpc"
+import * as RpcClient from "effect/rpc/RpcClient"
+import type { RpcClientError } from "effect/rpc/RpcClientError"
+import * as RpcGroup from "effect/rpc/RpcGroup"
+import * as RpcMiddleware from "effect/rpc/RpcMiddleware"
+import * as SqlClient from "effect/sql/SqlClient"
+import * as SqlError from "effect/sql/SqlError"
 import { describe, expect, expectTypeOf, it } from "vitest"
 import * as Capability from "../src/Capability.js"
 import * as Pipeline from "../src/Pipeline.js"
@@ -652,11 +655,14 @@ describe("request batching and transactional execution", () => {
       Rpc.make("incrementAfterCommit", { success: Schema.Number }),
       Rpc.make("incrementAndFail", { success: Schema.Never, error: MutationFailed }),
       Rpc.make("incrementScheduleAndFail", { success: Schema.Never, error: MutationFailed }),
+      Rpc.make("incrementAndDie", { success: Schema.Never }),
+      Rpc.make("incrementThenWait", { success: Schema.Never }),
       Rpc.make("readTransaction", {
         success: Schema.Struct({ value: Schema.Number, transaction: Schema.String })
       })
     )
     let value = 0
+    const started = await Effect.runPromise(Deferred.make<void>())
     const handlers = await Effect.runPromise(App.toHandlers({
       increment: () => Effect.sync(() => ++value),
       incrementAfterCommit: () => Effect.gen(function*() {
@@ -673,6 +679,13 @@ describe("request batching and transactional execution", () => {
         yield* PipelineSql.afterCommit(Effect.sync(() => events.push("should-not-run")))
         return yield* new MutationFailed()
       }),
+      incrementAndDie: () => Effect.sync(() => { value++ }).pipe(Effect.andThen(Effect.die("private handler defect"))),
+      incrementThenWait: () => Effect.gen(function*() {
+        value++
+        yield* PipelineSql.afterCommit(Effect.sync(() => events.push("interrupted-after-commit")))
+        yield* Deferred.succeed(started, undefined)
+        return yield* Effect.never
+      }),
       // Effect SQL similarly hides its internal transaction-connection service
       // behind the SqlClient API while reading it dynamically at execution.
       readTransaction: () => Effect.map(TransactionConnection, ([connection]) => ({
@@ -688,10 +701,7 @@ describe("request batching and transactional execution", () => {
     const withTransaction = SqlClient.makeWithTransaction({
       transactionService: TransactionConnection,
       spanAttributes: [],
-      acquireConnection: Effect.sync(() => [
-        undefined,
-        { id: `tx-${++transactionSequence}`, before: value }
-      ] as const),
+      acquireConnection: () => Effect.sync(() => ({ id: `tx-${++transactionSequence}`, before: value })),
       begin: (connection) => Effect.sync(() => { events.push(`begin:${connection.id}`) }),
       savepoint: (connection, depth) => Effect.sync(() => { events.push(`savepoint:${connection.id}:${depth}`) }),
       commit: (connection) => Effect.sync(() => { events.push(`commit:${connection.id}`) }),
@@ -732,6 +742,17 @@ describe("request batching and transactional execution", () => {
     expect(scheduledFailure).toMatchObject({ _tag: "MutationFailed" })
     expect(events).not.toContain("should-not-run")
 
+    const defect = await Effect.runPromise(Effect.exit(client.incrementAndDie()))
+    expect(Exit.isFailure(defect) && Cause.hasDies(defect.cause)).toBe(true)
+    expect(value).toBe(2)
+    await Effect.runPromise(Effect.scoped(Effect.gen(function*() {
+      const running = yield* client.incrementThenWait().pipe(Effect.forkScoped)
+      yield* Deferred.await(started)
+      yield* Fiber.interrupt(running)
+    })))
+    expect(value).toBe(2)
+    expect(events).not.toContain("interrupted-after-commit")
+
     const invalid = await Effect.runPromise(PipelineServer.handle(App, {
       version: 1,
       definitionId: "wrong",
@@ -743,7 +764,7 @@ describe("request batching and transactional execution", () => {
       Effect.provideContext(handlers)
     ))
     expect(invalid).toMatchObject({ _tag: "Failure", error: { _tag: "PipelineProtocolError" } })
-    expect(events.filter((event) => event.startsWith("begin:"))).toHaveLength(4)
+    expect(events.filter((event) => event.startsWith("begin:"))).toHaveLength(6)
   })
 
   it("returns a stable execution error when transaction infrastructure fails", async () => {
@@ -767,7 +788,7 @@ describe("request batching and transactional execution", () => {
     expect(error).toMatchObject({
       _tag: "PipelineExecutionError",
       code: "TransactionFailed",
-      retryable: true
+      retryable: false
     })
     expect(String(error)).not.toContain("database unavailable")
   })

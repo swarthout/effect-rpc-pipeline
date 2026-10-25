@@ -40,13 +40,16 @@ export const SessionServiceLive = Layer.effect(SessionService, Effect.gen(functi
 
   return SessionService.of({
     register: Effect.fn("SessionService.register")(function*({ username, displayName, password }) {
-      if (password.length < 10) {
-        return yield* new InvalidInput({ field: "password", message: "Use at least ten characters" })
+      if (password.length < 10 || password.length > 1024) {
+        return yield* new InvalidInput({ field: "password", message: "Use between ten and 1024 characters" })
       }
+      if (username.trim().length < 3 || username.length > 64) return yield* new InvalidInput({ field: "username", message: "Use between three and 64 characters" })
+      if (displayName.trim().length === 0 || displayName.length > 120) return yield* new InvalidInput({ field: "displayName", message: "Use between one and 120 characters" })
       const user = yield* database.createUser({ username, displayName, passwordHash: yield* hashPassword(password) })
       return yield* issue(user)
     }),
     login: Effect.fn("SessionService.login")(function*({ username, password }) {
+      if (password.length > 1024 || username.length > 64) return yield* new Unauthorized({ reason: "Invalid username or password" })
       const record = yield* database.findUserByUsername(username).pipe(
         Effect.mapError(() => new Unauthorized({ reason: "Invalid username or password" }))
       )

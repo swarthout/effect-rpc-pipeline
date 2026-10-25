@@ -10,7 +10,9 @@ const application = Runtime.makeApplication({
   view,
   resources: layerHttpClient(),
   container: document.getElementById("root"),
-  devTools: { Message }
+  devTools: import.meta.env.DEV ? { Message } : false,
+  // Slow-phase diagnostics include full Models, including credential fields.
+  slow: false
 })
 
 Runtime.hydrate(application, { buildId: import.meta.env.FOLDKIT_BUILD_ID })

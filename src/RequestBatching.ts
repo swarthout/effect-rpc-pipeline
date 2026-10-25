@@ -9,7 +9,7 @@ import * as Option from "effect/Option"
 import type * as Request from "effect/Request"
 import * as RequestResolver from "effect/RequestResolver"
 import * as Semaphore from "effect/Semaphore"
-import * as RpcMiddleware from "effect/unstable/rpc/RpcMiddleware"
+import * as RpcMiddleware from "effect/rpc/RpcMiddleware"
 
 type AnyCache = Cache.Cache<any, any, any, any>
 

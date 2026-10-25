@@ -4,16 +4,16 @@ import * as Layer from "effect/Layer"
 import * as Option from "effect/Option"
 import type * as Scope from "effect/Scope"
 import * as Stream from "effect/Stream"
-import * as FetchHttpClient from "effect/unstable/http/FetchHttpClient"
-import * as Headers from "effect/unstable/http/Headers"
-import type * as RpcMiddleware from "effect/unstable/rpc/RpcMiddleware"
-import * as RpcClient from "effect/unstable/rpc/RpcClient"
-import { RpcClientDefect, RpcClientError } from "effect/unstable/rpc/RpcClientError"
-import * as Rpc from "effect/unstable/rpc/Rpc"
-import * as RpcGroup from "effect/unstable/rpc/RpcGroup"
-import * as RpcSerialization from "effect/unstable/rpc/RpcSerialization"
-import { RequestId } from "effect/unstable/rpc/RpcMessage"
-import * as Socket from "effect/unstable/socket/Socket"
+import * as FetchHttpClient from "effect/http/FetchHttpClient"
+import * as Headers from "effect/http/Headers"
+import type * as RpcMiddleware from "effect/rpc/RpcMiddleware"
+import * as RpcClient from "effect/rpc/RpcClient"
+import { RpcClientDefect, RpcClientError } from "effect/rpc/RpcClientError"
+import * as Rpc from "effect/rpc/Rpc"
+import * as RpcGroup from "effect/rpc/RpcGroup"
+import * as RpcSerialization from "effect/rpc/RpcSerialization"
+import { RequestId } from "effect/rpc/RpcMessage"
+import * as Socket from "effect/socket/Socket"
 import type { ClientApi, PipelineRequest, PipelineTransport } from "./Pipeline.js"
 import { makeClient } from "./Pipeline.js"
 import * as Duplex from "./Duplex.js"
@@ -33,8 +33,9 @@ const revive = (value: unknown): unknown => {
   if (Array.isArray(value)) return value.map(revive)
   if (value && typeof value === "object") {
     const object = value as Record<string, unknown>
-    if (object._tag === "None" && (object._id === "Option" || Object.keys(object).length <= 2)) return Option.none()
-    if (object._tag === "Some" && (object._id === "Option" || "value" in object)) return Option.some(revive(object.value))
+    if (object._id === "effect-rpc-pipeline/Undefined") return undefined
+    if (object._tag === "None" && object._id === "Option") return Option.none()
+    if (object._tag === "Some" && object._id === "Option") return Option.some(revive(object.value))
     return Object.fromEntries(Object.entries(object).map(([key, item]) => [key, revive(item)]))
   }
   return value
@@ -197,6 +198,7 @@ const makeResourceSafe = <Rpcs extends Rpc.Any>(
   const serialization = yield* RpcSerialization.RpcSerialization
   const acquire = makeNativeResources(group, id, middlewareServices).pipe(
     Effect.provide(protocol),
+    Effect.provideService(Duplex.Enabled, false),
     Effect.provideService(RpcSerialization.RpcSerialization, serialization)
   )
   const execute = (request: PipelineRequest) => Effect.scoped(Effect.flatMap(acquire, (resources) => resources.execute(request)))
