@@ -2,6 +2,7 @@ import { Match, Option } from "effect"
 import * as Markdown from "@foldkit/markdown"
 import type { Document, Html, HtmlBuilder } from "foldkit/html"
 import { Message, type Model } from "./main"
+import { benefits, effectIntegrationView, roundTripsView, selectedResultsView } from "./home"
 import {
   documentFor,
   findPage,
@@ -136,7 +137,7 @@ export const demoView = (model: Model, h: Builder): Html => {
         [h.Class("section-heading")],
         [
           h.p([h.Class("eyebrow")], ["FOLLOW THE DATA"]),
-          h.h2([], ["One graph. Every dependency."]),
+          h.h3([], ["Follow the execution"]),
           h.p([], ["Step through a pipeline to see how the server schedules its work."]),
         ],
       ),
@@ -325,35 +326,22 @@ const landing = (model: Model, h: Builder) =>
       h.section(
         [h.Class("principles"), h.AriaLabel("Core features")],
         [
-          ...[
-            {
-              number: "01",
-              title: "Keep the types",
-              text: "Use Effect RPC schemas, errors, services, and middleware. Remote values stay typed as you compose them.",
-            },
-            {
-              number: "02",
-              title: "Describe the dependencies",
-              text: "Pass a remote result into the next call. The server waits for that value and schedules independent work together.",
-            },
-            {
-              number: "03",
-              title: "Choose what comes back",
-              text: "Select objects, arrays, or individual fields. Intermediate results can stay on the server.",
-            },
-          ].map((item) =>
-            h.div(
-              [h.Class("principle")],
+          ...benefits.map((item) =>
+            h.a(
+              [h.Class("principle"), h.Href(`#${item.id}`)],
               [
                 h.span([h.Class("eyebrow")], [item.number]),
                 h.h2([], [item.title]),
                 h.p([], [item.text]),
+                h.span([h.Class("principle-more")], ["See how it works ↓"]),
               ],
             ),
           ),
         ],
       ),
-      demoView(model, h),
+      effectIntegrationView(h, (code, label) => codeBlock(code, model, h, label)),
+      roundTripsView(h, (code, label) => codeBlock(code, model, h, label), demoView(model, h)),
+      selectedResultsView(model, h, (code, label) => codeBlock(code, model, h, label)),
       h.section(
         [h.Class("explore-section")],
         [

@@ -5,6 +5,7 @@ import data from "./generated/content.json"
 export const base = import.meta.env.BASE_URL
 export const pages = data.pages
 export const heroCode = data.heroCode
+export const homepage: Readonly<Record<string, string>> = data.homepage
 export const href = (slug = "") => `${base}${slug ? `${slug}/` : ""}`
 export const findPage = (slug: string) =>
   Option.fromNullishOr(pages.find((page) => page.slug === slug))
