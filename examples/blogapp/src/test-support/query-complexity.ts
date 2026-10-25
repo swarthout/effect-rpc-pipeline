@@ -1,6 +1,6 @@
 import * as Effect from "effect/Effect"
-import type * as Rpc from "effect/unstable/rpc/Rpc"
-import type * as RpcGroup from "effect/unstable/rpc/RpcGroup"
+import type * as Rpc from "effect/rpc/Rpc"
+import type * as RpcGroup from "effect/rpc/RpcGroup"
 import * as Tracer from "effect/Tracer"
 
 export type StatementKind = "read" | "write" | "other"
@@ -46,7 +46,6 @@ const statementKind = (sql: string): StatementKind => {
 
 const reportFrom = (spans: ReadonlyArray<Tracer.NativeSpan>): QueryReport => {
   const statements = spans.flatMap((span): ReadonlyArray<StatementExecution> => {
-    if (span.name !== "sql.execute") return []
     const sql = span.attributes.get("db.query.text")
     if (typeof sql !== "string") return []
     return [{ sql, fingerprint: normalizeSql(sql), kind: statementKind(sql) }]
@@ -61,7 +60,8 @@ const reportFrom = (spans: ReadonlyArray<Tracer.NativeSpan>): QueryReport => {
       if (span.name.startsWith("BlogRpc.") && span.name !== "BlogRpc.execute") {
         return [span.name.slice("BlogRpc.".length)]
       }
-      if (span.name.startsWith("RpcServer.")) return [span.name.slice("RpcServer.".length)]
+      const method = span.attributes.get("rpc.method")
+      if (span.attributes.get("rpc.system.name") === "effect_rpc" && typeof method === "string") return [method]
       return []
     })),
     reads: statements.filter(({ kind }) => kind === "read").length,

@@ -1,6 +1,6 @@
 import type * as Cause from "effect/Cause"
 import * as Effect from "effect/Effect"
-import * as SqlClient from "effect/unstable/sql/SqlClient"
+import * as SqlClient from "effect/sql/SqlClient"
 import { denyPeerCalls } from "./ExecutionPolicy.js"
 import { PipelineExecutionError } from "./Pipeline.js"
 import { makeMiddleware, type ExecutionContext, type Middleware } from "./PipelineServer.js"
@@ -40,7 +40,9 @@ export const transaction = (options?: TransactionOptions): Middleware<PipelineEx
           : Effect.fail(new PipelineExecutionError({
             message: "SQL transaction failed",
             code: "TransactionFailed",
-            retryable: true
+            // A failed COMMIT can have an unknown outcome. Replaying a mutation
+            // is unsafe without application-level idempotency.
+            retryable: false
           }))))
         return transaction.pipe(
           Effect.flatMap((value) => DeferredEffects.drain(

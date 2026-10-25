@@ -1,10 +1,16 @@
 import * as Context from "effect/Context"
 import * as Effect from "effect/Effect"
-import * as Rpc from "effect/unstable/rpc/Rpc"
-import type * as RpcClient from "effect/unstable/rpc/RpcClient"
-import type * as RpcGroup from "effect/unstable/rpc/RpcGroup"
-import * as RpcSchema from "effect/unstable/rpc/RpcSchema"
+import * as Option from "effect/Option"
+import * as Rpc from "effect/rpc/Rpc"
+import type * as RpcClient from "effect/rpc/RpcClient"
+import type * as RpcGroup from "effect/rpc/RpcGroup"
+import * as RpcSchema from "effect/rpc/RpcSchema"
 import * as Schema from "effect/Schema"
+import * as Scope from "effect/Scope"
+import * as SqlClient from "effect/sql/SqlClient"
+import { CurrentRegion } from "./DeferredEffects.js"
+import { PeerCalls } from "./ExecutionPolicy.js"
+import { makeScope, RequestScope } from "./RequestBatching.js"
 
 export const CapabilityGroupTypeId = Symbol.for("effect-rpc-pipeline/CapabilityGroup")
 
@@ -121,7 +127,12 @@ export const invokeLocal = (
     effect = middleware(effect, { ...options, rpc, payload: decoded })
   }
   return yield* effect
-}).pipe(Effect.provideContext(instance.context)) as Effect.Effect<unknown, unknown>
+}).pipe(
+  Effect.provideContext(instance.context),
+  (effect) => Effect.flatMap(Effect.serviceOption(RequestScope), (scope) => Effect.provideService(
+    effect, RequestScope, Option.isSome(scope) ? scope.value : makeScope()
+  ))
+) as Effect.Effect<unknown, unknown>
 
 /** Invokes a local capability and encodes its declared success or failure for transport. */
 export const invokeWire = (
@@ -197,6 +208,8 @@ export const fromRemoteRef = (
 
 /** Defines a typed, batch-local capability surface using standard RpcGroup handlers. */
 export const make = <Group extends RpcGroup.RpcGroup<any>>(id: string, group: Group): CapabilityDefinition<Group> => {
+  const reserved = new Set(["then", "release", "invoke", "_tag", "capabilityId", "definitionId", "group", "owner", "context"])
+  for (const method of group.requests.keys()) if (reserved.has(method)) throw new Error(`Capability method "${method}" is reserved`)
   if (definitions.has(id)) throw new Error(`Capability definition "${id}" is already registered`)
   const descriptor: CapabilityDefinition<Group> = {
     _tag: "CapabilityDescriptor",
@@ -205,8 +218,13 @@ export const make = <Group extends RpcGroup.RpcGroup<any>>(id: string, group: Gr
     schema: Schema.declare<CapabilityInstance<Group>>((value): value is CapabilityInstance<Group> =>
       isInstance(value) && value.definitionId === id && value.group === group),
     fromHandlers: (handlers: unknown) => Effect.gen(function*() {
-      const ambient = yield* Effect.context<any>()
-      const handlerContext = yield* group.toHandlers(handlers as any)
+      const captured = yield* Effect.context<any>()
+      // Principals and application services may outlive a request. Transaction
+      // connections, caches, deferred regions, policies and scopes may not.
+      let ambient = Context.omit(RequestScope, CurrentRegion, PeerCalls, Scope.Scope)(captured)
+      const sql = Context.getOrUndefined(captured, SqlClient.SqlClient)
+      if (sql?.transactionService !== undefined) ambient = Context.omit(sql.transactionService)(ambient)
+      const handlerContext = yield* group.toHandlers(handlers as any).pipe(Effect.setContext(ambient))
       const capabilityId = newCapabilityId()
       const base: InstanceBase<Group> = {
         _tag: "CapabilityInstance" as const,
@@ -237,7 +255,7 @@ export const isInstance = (u: unknown): u is CapabilityInstance =>
   Context.isContext((u as any).context)
 
 export const isSchema = (u: unknown): boolean =>
-  typeof u === "object" && u !== null && (u as any)._tag === "CapabilitySchema"
+  [...definitions.values()].some((definition) => definition.schema === u)
 
 /** Explicitly releases a remote capability before the connection scope closes. */
 export const release = (instance: CapabilityInstance): Effect.Effect<void, unknown> => instance.release

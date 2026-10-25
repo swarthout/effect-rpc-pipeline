@@ -12,9 +12,9 @@ import * as Fiber from "effect/Fiber"
 import * as Layer from "effect/Layer"
 import * as Queue from "effect/Queue"
 import * as Stream from "effect/Stream"
-import * as HttpRouter from "effect/unstable/http/HttpRouter"
-import * as HttpServer from "effect/unstable/http/HttpServer"
-import * as Socket from "effect/unstable/socket/Socket"
+import * as HttpRouter from "effect/http/HttpRouter"
+import * as HttpServer from "effect/http/HttpServer"
+import * as Socket from "effect/socket/Socket"
 import { describe, expect, it } from "vitest"
 import { BlogClient, layerWebSocketClient, makeHttpClient, withAccessToken } from "./client/blog-client.js"
 import { BlogDatabase } from "./server/database.js"
@@ -183,7 +183,7 @@ const makeWebSocketReport = (): Effect.Effect<{
     )
     const context = yield* Layer.build(ServerLive as Layer.Layer<HttpServer.HttpServer, never, never>)
     const server = Context.get(context, HttpServer.HttpServer)
-    if (server.address._tag !== "TcpAddress") return yield* Effect.die("Expected TCP test server")
+    if (server.address._tag === "UnixPathAddress") return yield* Effect.die("Expected TCP test server")
     const http = `http://127.0.0.1:${server.address.port}/rpc`
     const websocket = `ws://127.0.0.1:${server.address.port}/rpc`
 

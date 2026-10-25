@@ -3,13 +3,16 @@ import * as Duration from "effect/Duration"
 import * as Effect from "effect/Effect"
 import * as Layer from "effect/Layer"
 import * as Schema from "effect/Schema"
-import * as HttpRouter from "effect/unstable/http/HttpRouter"
-import * as HttpServerResponse from "effect/unstable/http/HttpServerResponse"
+import * as HttpRouter from "effect/http/HttpRouter"
+import * as HttpServerResponse from "effect/http/HttpServerResponse"
 import { BrowserSession } from "../shared/contracts.js"
 import { SessionService, type IssuedSession } from "./sessions.js"
 
 const refreshCookie = "pipeline_press_refresh"
 const cookiePath = "/session"
+if (process.env.NODE_ENV === "production" && !process.env.BLOG_PUBLIC_ORIGIN?.startsWith("https://")) {
+  throw new Error("Production requires an HTTPS BLOG_PUBLIC_ORIGIN")
+}
 
 const LoginInput = Schema.Struct({ username: Schema.String, password: Schema.String })
 const RegisterInput = Schema.Struct({ username: Schema.String, displayName: Schema.String, password: Schema.String })
@@ -31,10 +34,13 @@ const errorStatus = (error: unknown): number => {
 }
 
 const errorResponse = (cause: Cause.Cause<unknown>) => {
+  if (Cause.hasDies(cause)) return Effect.succeed(HttpServerResponse.jsonUnsafe({ error: "Session request failed" }, { status: 500 }))
   const error = Cause.squash(cause)
-  const message = error !== null && typeof error === "object" && "message" in error
-    ? String(error.message)
-    : "Session request failed"
+  const message = error !== null && typeof error === "object" && "reason" in error
+    ? String(error.reason)
+    : error !== null && typeof error === "object" && "message" in error && error.message
+      ? String(error.message)
+      : "Session request failed"
   return Effect.succeed(HttpServerResponse.jsonUnsafe({ error: message }, { status: errorStatus(error) }))
 }
 
@@ -46,7 +52,8 @@ const requireSameOrigin = (request: { readonly headers: Readonly<Record<string, 
   }
   return Effect.try({
     try: () => {
-      if (new URL(origin).host !== host) throw new SameOriginRequired("Cross-origin session request rejected")
+      const expectedOrigin = process.env.BLOG_PUBLIC_ORIGIN ?? `http://${host}`
+      if (new URL(origin).origin !== new URL(expectedOrigin).origin || origin !== new URL(origin).origin) throw new SameOriginRequired("Cross-origin session request rejected")
     },
     catch: (error) => error
   })

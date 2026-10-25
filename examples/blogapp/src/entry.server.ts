@@ -33,9 +33,10 @@ export const renderPage = (request: Request): Promise<Server.EntryResult> => Eff
       { flags, buildId: import.meta.env.FOLDKIT_BUILD_ID }
     )
     return Server.Rendered(rendered, {
+      status: flags.page === "NotFound" ? 404 : 200,
       headers: {
         "cache-control": request.headers.has("authorization") ? "private, no-store" : "public, max-age=30",
-        "content-security-policy": "default-src 'self'; connect-src 'self' ws:; style-src 'self' 'unsafe-inline'; img-src 'self' data:",
+        "content-security-policy": "default-src 'self'; connect-src 'self' ws: wss:; style-src 'self' 'unsafe-inline'; img-src 'self' data:",
         "x-content-type-options": "nosniff",
         "referrer-policy": "strict-origin-when-cross-origin"
       }

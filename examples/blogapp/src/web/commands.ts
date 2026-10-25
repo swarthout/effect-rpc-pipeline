@@ -3,7 +3,12 @@ import { Command } from "foldkit"
 import { BlogClient, loginSession, logoutSession, refreshSession, registerSession, withAccessToken } from "../client/blog-client.js"
 import { Message } from "./message.js"
 
-const failed = (error: unknown) => Message.FailedRequest({ error: String(error) })
+const failed = (error: unknown) => Message.FailedRequest({ error:
+  error !== null && typeof error === "object" && "message" in error ? String(error.message)
+    : error !== null && typeof error === "object" && "reason" in error ? String(error.reason)
+    : error !== null && typeof error === "object" && "_tag" in error ? String(error._tag)
+    : String(error)
+})
 const safely = <A, E, R>(effect: Effect.Effect<A, E, R>) => effect.pipe(
   Effect.catch((error) => Effect.succeed(failed(error))),
   Effect.scoped

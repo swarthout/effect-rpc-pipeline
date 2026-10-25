@@ -1,6 +1,6 @@
 import * as Effect from "effect/Effect"
 import * as Stream from "effect/Stream"
-import type * as RpcGroup from "effect/unstable/rpc/RpcGroup"
+import type * as RpcGroup from "effect/rpc/RpcGroup"
 import * as Pipeline from "effect-rpc-pipeline/Pipeline"
 import * as PipelineClient from "effect-rpc-pipeline/PipelineClient"
 import type { PipelineRequest } from "effect-rpc-pipeline/Pipeline"

@@ -48,7 +48,7 @@ export const make = (options?: TelemetryOptions): Middleware => {
     request: (effect, context) => {
       let instrumented = effect
       if (metrics !== false) {
-        const attributes = { definition: context.request.definitionId }
+        const attributes = { definition: context.definitionId }
         instrumented = Effect.andThen(
           Metric.update(Metric.withAttributes(nodeCount, attributes), context.request.nodes.length),
           instrumented.pipe(
@@ -72,7 +72,7 @@ export const make = (options?: TelemetryOptions): Middleware => {
     invocation: (effect, context) => {
       let instrumented = effect
       const attributes = {
-        definition: context.request.definitionId,
+        definition: context.definitionId,
         rpc: context.rpc._tag,
         kind: context.kind
       }

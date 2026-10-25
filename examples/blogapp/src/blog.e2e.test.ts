@@ -11,10 +11,10 @@ import * as Fiber from "effect/Fiber"
 import * as Layer from "effect/Layer"
 import * as Queue from "effect/Queue"
 import * as Stream from "effect/Stream"
-import * as HttpRouter from "effect/unstable/http/HttpRouter"
-import * as HttpServer from "effect/unstable/http/HttpServer"
-import * as RpcSerialization from "effect/unstable/rpc/RpcSerialization"
-import * as Socket from "effect/unstable/socket/Socket"
+import * as HttpRouter from "effect/http/HttpRouter"
+import * as HttpServer from "effect/http/HttpServer"
+import * as RpcSerialization from "effect/rpc/RpcSerialization"
+import * as Socket from "effect/socket/Socket"
 import * as Pipeline from "effect-rpc-pipeline/Pipeline"
 import * as PipelineClient from "effect-rpc-pipeline/PipelineClient"
 import { describe, expect, it } from "vitest"
@@ -30,7 +30,7 @@ const testServer = <A, E, R>(run: (urls: { readonly http: string; readonly webso
   )
   const context = yield* Layer.build(ServerLive as Layer.Layer<HttpServer.HttpServer, never, never>)
   const server = Context.get(context, HttpServer.HttpServer)
-  if (server.address._tag !== "TcpAddress") return yield* Effect.die("Expected TCP test server")
+  if (server.address._tag === "UnixPathAddress") return yield* Effect.die("Expected TCP test server")
   return yield* run({
     http: `http://127.0.0.1:${server.address.port}/rpc`,
     websocket: `ws://127.0.0.1:${server.address.port}/rpc`
@@ -89,6 +89,8 @@ describe("Pipeline Press end to end", () => {
       const roleChanged = yield* admin.setRole(graceSession.user.id, "Reader")
       const moderatedComment = yield* admin.moderateComment(remainingComments.at(0)!.id)
       const unpublished = yield* admin.moderatePost(post.id, "Draft")
+      expect(yield* grace.comment(post.id, "Cannot comment on another user's draft").pipe(Effect.flip)).toMatchObject({ _tag: "Forbidden" })
+      expect(yield* grace.toggleUpvote(post.id).pipe(Effect.flip)).toMatchObject({ _tag: "Forbidden" })
       const republished = yield* admin.moderatePost(post.id, "Published")
       const suspended = yield* admin.setSuspended(graceSession.user.id, true)
       const suspendedLogin = yield* publicClient.login({ username: "grace", password: "another strong password" }).pipe(Effect.flip)
@@ -146,12 +148,30 @@ describe("Pipeline Press end to end", () => {
         headers: { origin: "https://attacker.example", cookie: secondCookie.split(";", 1)[0]! }
       })
       expect(crossOrigin.status).toBe(403)
+      const wrongScheme = await fetch(`${origin}/session/refresh`, {
+        method: "POST", headers: { origin: origin.replace("http:", "https:"), cookie: secondCookie.split(";", 1)[0]! }
+      })
+      expect(wrongScheme.status).toBe(403)
 
       const logout = await request("/session/logout", { headers: { origin, cookie: secondCookie.split(";", 1)[0]! } })
       expect(logout.status).toBe(204)
       expect(logout.headers.get("set-cookie")).toContain("Max-Age=0")
       const afterLogout = await request("/session/refresh", { headers: { origin, cookie: secondCookie.split(";", 1)[0]! } })
       expect(afterLogout.status).toBe(401)
+    })))
+  })
+
+  it("allows exactly one concurrent refresh of a browser cookie", async () => {
+    await Effect.runPromise(testServer(({ http }) => Effect.promise(async () => {
+      const origin = http.slice(0, -"/rpc".length)
+      const registered = await fetch(`${origin}/session/register`, {
+        method: "POST", headers: { origin, "content-type": "application/json" },
+        body: JSON.stringify({ username: "refresh-race", displayName: "Refresh Race", password: "a sufficiently strong password" })
+      })
+      expect(registered.status).toBe(200)
+      const cookie = registered.headers.get("set-cookie")!.split(";", 1)[0]!
+      const responses = await Promise.all([1, 2].map(() => fetch(`${origin}/session/refresh`, { method: "POST", headers: { origin, cookie } })))
+      expect(responses.map((response) => response.status).sort()).toEqual([200, 401])
     })))
   })
 
@@ -195,7 +215,11 @@ describe("Pipeline Press end to end", () => {
           drafts: rpc.myPosts(),
           author: rpc.getUser({ id: published.authorId })
         })
-        return { published, event, callbackAccepted, notification, combined }
+        const adminSession = yield* publicClient.login({ username: "admin", password: "admin-password-change-me" })
+        const adminClient = yield* makeHttpClient(http, adminSession.accessToken)
+        yield* adminClient.setSuspended(session.user.id, true)
+        const revoked = yield* Effect.flip(authorSession.publish())
+        return { published, event, callbackAccepted, notification, combined, revoked }
       }).pipe(
         (effect) => withAccessToken(effect, session.accessToken),
         Effect.provide(layerWebSocketClient(websocket)),
@@ -208,6 +232,7 @@ describe("Pipeline Press end to end", () => {
     expect(result.callbackAccepted).toBe(true)
     expect(result.notification).toMatchObject({ postId: "welcome" })
     expect(result.combined.current.username).toBe("linus")
+    expect(result.revoked).toMatchObject({ _tag: "Forbidden" })
     expect(result.combined.author.displayName).toBe("Linus Torvalds")
   })
 })

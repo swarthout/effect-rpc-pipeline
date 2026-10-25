@@ -2,16 +2,44 @@ import * as Effect from "effect/Effect"
 import * as Deferred from "effect/Deferred"
 import * as Fiber from "effect/Fiber"
 import * as Schema from "effect/Schema"
-import * as Rpc from "effect/unstable/rpc/Rpc"
-import * as RpcGroup from "effect/unstable/rpc/RpcGroup"
-import * as RpcTest from "effect/unstable/rpc/RpcTest"
-import * as SqlClient from "effect/unstable/sql/SqlClient"
+import * as Rpc from "effect/rpc/Rpc"
+import * as RpcGroup from "effect/rpc/RpcGroup"
+import * as RpcTest from "effect/rpc/RpcTest"
+import * as Stream from "effect/Stream"
+import * as SqlClient from "effect/sql/SqlClient"
 import { describe, expect, expectTypeOf, it } from "vitest"
 import * as Capability from "../src/Capability.js"
 import * as Duplex from "../src/Duplex.js"
 import * as PipelineSql from "../src/Sql.js"
 
 describe("bidirectional capability sessions", () => {
+  it("keeps a new session when an older stream finishes late", async () => {
+    await Effect.runPromise(Effect.gen(function*() {
+      const server = yield* Duplex.makeServer
+      const old = yield* server.open("reused-id", 1)
+      yield* server.open("replacement", 1)
+      yield* server.open("reused-id", 2)
+      yield* Stream.runDrain(old)
+      const duplicate = yield* Effect.flip(server.open("reused-id", 3))
+      expect(duplicate).toMatchObject({ _tag: "DuplexError" })
+    }))
+  })
+
+  it("fails readiness when the peer closes before the handshake", async () => {
+    const failure = await Effect.runPromise(Effect.scoped(Effect.gen(function*() {
+      const handlers = yield* Duplex.Rpcs.toHandlers({
+        [Duplex.SessionRpc._tag]: () => Stream.empty,
+        [Duplex.ReplyRpc._tag]: () => Effect.void,
+        [Duplex.CallServerCapabilityRpc._tag]: () => Effect.succeed({}),
+        [Duplex.ReleaseCapabilityRpc._tag]: () => Effect.void
+      })
+      const rpc = yield* RpcTest.makeClient(Duplex.Rpcs).pipe(Effect.provideContext(handlers))
+      const session = yield* Duplex.makeClientSession(rpc)
+      return yield* Effect.flip(session.ready.pipe(Effect.timeout("50 millis")))
+    })))
+    expect(failure).toMatchObject({ _tag: "DuplexError" })
+  })
+
   it("lets the server invoke a typed capability exported by the client", async () => {
     class ApprovalFailed extends Schema.TaggedError<ApprovalFailed>()("ApprovalFailed", {
       reason: Schema.String

@@ -4,9 +4,9 @@ import * as PubSub from "effect/PubSub"
 import * as Redacted from "effect/Redacted"
 import * as Schema from "effect/Schema"
 import * as Stream from "effect/Stream"
-import * as Rpc from "effect/unstable/rpc/Rpc"
-import * as RpcGroup from "effect/unstable/rpc/RpcGroup"
-import * as RpcMiddleware from "effect/unstable/rpc/RpcMiddleware"
+import * as Rpc from "effect/rpc/Rpc"
+import * as RpcGroup from "effect/rpc/RpcGroup"
+import * as RpcMiddleware from "effect/rpc/RpcMiddleware"
 
 export const TodoFilter = Schema.Union([Schema.Literal("all"), Schema.Literal("active"), Schema.Literal("completed")])
 export type TodoFilter = Schema.Schema.Type<typeof TodoFilter>

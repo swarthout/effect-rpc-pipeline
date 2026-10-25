@@ -7,7 +7,7 @@ import * as PipelineServer from "effect-rpc-pipeline/PipelineServer"
 import * as PipelineClient from "effect-rpc-pipeline/PipelineClient"
 import * as PipelineSql from "effect-rpc-pipeline/Sql"
 import * as PipelineTelemetry from "effect-rpc-pipeline/Telemetry"
-import * as RpcSerialization from "effect/unstable/rpc/RpcSerialization"
+import * as RpcSerialization from "effect/rpc/RpcSerialization"
 import { AppRpcs, HealthRpc, RegisterRpc, LoginRpc, RefreshRpc, ListPostsRpc, GetPostRpc, GetUserRpc, ListCommentsRpc, WatchPostRpc, type BlogEvent } from "../shared/contracts.js"
 import { BlogDatabase, BlogDatabaseLive } from "./database.js"
 import { assertAuthenticationCoverage, makeAuthLayers } from "./authentication.js"
@@ -46,7 +46,11 @@ export const makeBlogLayers = (filename: string) => {
     yield* database.migrate
     const existing = yield* database.findUserByUsername("admin").pipe(Effect.option)
     if (existing._tag === "None") {
-      const passwordHash = yield* hashPassword("admin-password-change-me")
+      const adminPassword = process.env.BLOG_ADMIN_PASSWORD ?? "admin-password-change-me"
+      if (process.env.NODE_ENV === "production" && (process.env.BLOG_ADMIN_PASSWORD === undefined || adminPassword.length < 16)) {
+        return yield* Effect.die(new Error("Initial production setup requires BLOG_ADMIN_PASSWORD with at least 16 characters"))
+      }
+      const passwordHash = yield* hashPassword(adminPassword)
       yield* database.createUser({ username: "admin", displayName: "Pipeline Admin", passwordHash, role: "Admin" }).pipe(Effect.orDie)
     }
   })).pipe(Layer.provide(BaseLive))
@@ -66,14 +70,14 @@ export const makeBlogLayers = (filename: string) => {
       path: "/rpc",
       id: "pipeline-press",
       middleware: pipelineMiddleware,
-      limits: { maxNodes: 250, maxMapItems: 100, maxInvocations: 500, concurrency: 100 }
+      limits: { maxNodes: 250, maxMapItems: 100, maxInvocations: 500, concurrency: 500 }
     }),
     PipelineServer.layerWebSocket({
       group: AppRpcs,
       path: "/rpc",
       id: "pipeline-press",
       middleware: pipelineMiddleware,
-      limits: { maxNodes: 250, maxMapItems: 100, maxInvocations: 500, concurrency: 100 }
+      limits: { maxNodes: 250, maxMapItems: 100, maxInvocations: 500, concurrency: 500 }
     })
   ).pipe(
     Layer.provide(ServicesLive),
@@ -90,7 +94,7 @@ export const makeBlogLayers = (filename: string) => {
   const InProcessPipelineLive = PipelineClient.layerClientInProcess(AppPipelineClient, AppRpcs, {
     id: "pipeline-press",
     middleware: pipelineMiddleware,
-    limits: { maxNodes: 250, maxMapItems: 100, maxInvocations: 500, concurrency: 100 }
+    limits: { maxNodes: 250, maxMapItems: 100, maxInvocations: 500, concurrency: 500 }
   }).pipe(
     Layer.provide(AuthenticatedClientLive),
     Layer.provide(ServicesLive),

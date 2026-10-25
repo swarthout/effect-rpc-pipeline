@@ -10,15 +10,18 @@
     "test": "vitest run"
   },
   "dependencies": {
-    "effect": "4.0.0-rc.112",
+    "effect": "4.0.6",
     "effect-rpc-pipeline": "file:../..",
-    "jose": "^6.2.10"
+    "jose": "6.2.13"
   },
   "devDependencies": {
-    "@effect/platform-node": "4.0.0-rc.112",
-    "@types/node": "^24.0.0",
-    "tsx": "^4.21.0",
-    "typescript": "^5.9.3",
-    "vitest": "^3.2.7"
+    "@effect/platform-node": "4.0.6",
+    "@types/node": "26.6.5",
+    "tsx": "4.23.15",
+    "typescript": "7.0.2",
+    "vitest": "5.0.5"
+  },
+  "engines": {
+    "node": "^24.11.0 || >=26.0.0"
   }
 }

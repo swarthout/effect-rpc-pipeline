@@ -1,13 +1,15 @@
 import * as Context from "effect/Context"
 import * as Effect from "effect/Effect"
 import * as Option from "effect/Option"
-import * as Rpc from "effect/unstable/rpc/Rpc"
-import * as RpcGroup from "effect/unstable/rpc/RpcGroup"
-import type * as RpcSerialization from "effect/unstable/rpc/RpcSerialization"
-import * as RpcServer from "effect/unstable/rpc/RpcServer"
-import type * as Headers from "effect/unstable/http/Headers"
-import type * as HttpRouter from "effect/unstable/http/HttpRouter"
+import * as Rpc from "effect/rpc/Rpc"
+import * as RpcGroup from "effect/rpc/RpcGroup"
+import type * as RpcSerialization from "effect/rpc/RpcSerialization"
+import * as RpcServer from "effect/rpc/RpcServer"
+import type * as Headers from "effect/http/Headers"
+import type * as HttpRouter from "effect/http/HttpRouter"
 import * as Schema from "effect/Schema"
+import * as Semaphore from "effect/Semaphore"
+import * as RpcSchema from "effect/rpc/RpcSchema"
 import * as Layer from "effect/Layer"
 import type { CapabilityInstance } from "./Capability.js"
 import { isInstance, isRef } from "./Capability.js"
@@ -27,6 +29,8 @@ export type RequestMetadata = {
 export type Requirements<R extends Rpc.Any> = Rpc.ToHandler<R> | Rpc.Middleware<R> | Rpc.ServicesServer<R>
 
 export interface RequestContext<R extends Rpc.Any = any> {
+  /** Configured server definition, independent of untrusted request metadata. */
+  readonly definitionId: string
   readonly group: RpcGroup.RpcGroup<R>
   readonly request: PipelineRequest
   readonly metadata: RequestMetadata
@@ -68,6 +72,9 @@ export interface ServerOptions<M extends ReadonlyArray<Middleware<any, any>> = r
     readonly maxMapItems?: number
     readonly maxInvocations?: number
     readonly concurrency?: number
+    readonly maxDepth?: number
+    readonly maxExpressionNodes?: number
+    readonly maxExecutionSteps?: number
   }
 }
 
@@ -76,6 +83,9 @@ interface ExecutionLimits {
   readonly maxMapItems: number
   readonly maxInvocations: number
   readonly concurrency: number
+  readonly maxDepth: number
+  readonly maxExpressionNodes: number
+  readonly maxExecutionSteps: number
 }
 
 const positiveLimit = (value: number | undefined, fallback: number): number =>
@@ -85,23 +95,27 @@ const executionLimits = (options?: ServerOptions<any>): ExecutionLimits => ({
   maxNodes: positiveLimit(options?.limits?.maxNodes, 1000),
   maxMapItems: positiveLimit(options?.limits?.maxMapItems, 1000),
   maxInvocations: positiveLimit(options?.limits?.maxInvocations, 10_000),
-  concurrency: positiveLimit(options?.limits?.concurrency, 64)
+  concurrency: positiveLimit(options?.limits?.concurrency, 64),
+  maxDepth: positiveLimit(options?.limits?.maxDepth, 64),
+  maxExpressionNodes: positiveLimit(options?.limits?.maxExpressionNodes, 100_000),
+  maxExecutionSteps: positiveLimit(options?.limits?.maxExecutionSteps, 100_000)
 })
 
 const PathSchema = Schema.Array(Schema.Union([Schema.String, Schema.Number]))
-export const ExprSchema: Schema.Schema<Expr> = Schema.suspend(() => Schema.Union([
+export const ExprSchema: Schema.Codec<Expr> = Schema.suspend(() => Schema.Union([
   Schema.Struct({ _tag: Schema.Literal("literal"), value: Schema.optionalKey(Schema.Json) }),
   Schema.Struct({ _tag: Schema.Literal("ref"), id: Schema.String, path: PathSchema }),
-  Schema.Struct({ _tag: Schema.Literal("item"), path: PathSchema }),
+  Schema.Struct({ _tag: Schema.Literal("item"), scope: Schema.String, path: PathSchema }),
   Schema.Struct({ _tag: Schema.Literal("array"), values: Schema.Array(ExprSchema) }),
   Schema.Struct({ _tag: Schema.Literal("object"), entries: Schema.Array(Schema.Tuple([Schema.String, ExprSchema])) }),
   Schema.Struct({ _tag: Schema.Literal("none") }),
   Schema.Struct({ _tag: Schema.Literal("some"), value: ExprSchema })
-])) as Schema.Schema<Expr>
-export const PipelineNodeSchema: Schema.Schema<PipelineNode> = Schema.Union([
+])) as Schema.Codec<Expr>
+export const PipelineNodeSchema: Schema.Codec<PipelineNode> = Schema.Union([
   Schema.Struct({
     _tag: Schema.Literal("call"),
     id: Schema.String,
+    scope: Schema.optionalKey(Schema.String),
     target: Schema.optionalKey(ExprSchema),
     method: Schema.String,
     payload: ExprSchema,
@@ -110,96 +124,113 @@ export const PipelineNodeSchema: Schema.Schema<PipelineNode> = Schema.Union([
   Schema.Struct({
     _tag: Schema.Literal("map"),
     id: Schema.String,
+    scope: Schema.optionalKey(Schema.String),
     source: ExprSchema,
     template: ExprSchema,
     dependencies: Schema.Array(Schema.String)
   })
-]) as Schema.Schema<PipelineNode>
-export const PipelineRequestSchema: Schema.Schema<PipelineRequest> = Schema.Struct({
+]) as Schema.Codec<PipelineNode>
+export const PipelineRequestSchema: Schema.Codec<PipelineRequest> = Schema.Struct({
   version: Schema.Literal(1),
   definitionId: Schema.String,
   nodes: Schema.Array(PipelineNodeSchema),
   selection: ExprSchema,
   discards: Schema.Array(Schema.String)
-}) as Schema.Schema<PipelineRequest>
+}) as Schema.Codec<PipelineRequest>
 
 export const PipelineRpc = Rpc.make("__effect_rpc_pipeline_v1", {
-  payload: PipelineRequestSchema,
+  // Structural validation is bounded inside the handler, before recursively
+  // decoding expressions. Native RPC must not recurse through the graph first.
+  payload: Schema.declare<PipelineRequest>((value): value is PipelineRequest => typeof value === "object" && value !== null),
   success: Schema.Unknown,
   error: Schema.Unknown
 })
 
-const pathValue = (value: unknown, path: ReadonlyArray<string | number>): unknown => {
+interface ExecutionWork {
+  readonly step: Effect.Effect<void, PipelineProtocolError>
+  readonly consume: () => void
+}
+
+const makeExecutionWork = (limit: number): ExecutionWork => {
+  let steps = 0
+  const consume = () => {
+    if (++steps > limit) throw new PipelineProtocolError("Pipeline execution work limit exceeded", "LimitExceeded")
+  }
+  return {
+    consume,
+    step: Effect.try({ try: consume, catch: (error) => error as PipelineProtocolError })
+  }
+}
+
+const pathValue = (value: unknown, path: ReadonlyArray<string | number>, work: ExecutionWork): unknown => {
   let current = value
   for (const part of path) {
+    work.consume()
     if (current === null || current === undefined) throw new PipelineProtocolError(`Cannot read ${String(part)} from nullish value`, "InvalidPath")
+    if (part === "__proto__" || part === "prototype" || part === "constructor" ||
+      (typeof part === "number" && (!Number.isSafeInteger(part) || part < 0)) ||
+      (!Object.hasOwn(Object(current), part) && part in Object(current))) {
+      throw new PipelineProtocolError(`Invalid own-property path ${String(part)}`, "InvalidPath")
+    }
     current = (current as any)[part]
   }
   return current
 }
 
-const evalExpr = (expr: Expr, values: Map<string, unknown>, item?: unknown): unknown => {
+const evalExpr = (expr: Expr, values: Map<string, unknown>, items: ReadonlyMap<string, unknown>, work: ExecutionWork): unknown => {
+  work.consume()
   switch (expr._tag) {
     case "literal": return expr.value
     case "ref": {
-      if (expr.id === "__item__") return pathValue(item, expr.path)
-      if (expr.id === "__root__") throw new PipelineProtocolError("Root API cannot be used as a value", "InvalidReference")
       if (!values.has(expr.id)) throw new PipelineProtocolError(`Unknown or unresolved ref ${expr.id}`, "InvalidReference")
-      return pathValue(values.get(expr.id), expr.path)
+      return pathValue(values.get(expr.id), expr.path, work)
     }
-    case "item": return pathValue(item, expr.path)
-    case "array": return expr.values.map((value) => evalExpr(value, values, item))
-    case "object": return Object.fromEntries(expr.entries.map(([key, value]) => [key, evalExpr(value, values, item)]))
+    case "item": {
+      if (!items.has(expr.scope)) throw new PipelineProtocolError("Map item escaped its scope", "InvalidReference")
+      return pathValue(items.get(expr.scope), expr.path, work)
+    }
+    case "array": return expr.values.map((value) => evalExpr(value, values, items, work))
+    case "object": return Object.fromEntries(expr.entries.map(([key, value]) => [key, evalExpr(value, values, items, work)]))
     case "none": return Option.none()
-    case "some": return Option.some(evalExpr(expr.value, values, item))
+    case "some": return Option.some(evalExpr(expr.value, values, items, work))
   }
 }
 
-// Pipeline expressions preserve Effect values so they can be selected and mapped.
-// RPC payload schemas, however, decode from their encoded wire representation.
-const encodePayloadOptions = (value: unknown): unknown => {
-  if (Option.isOption(value)) return Option.isNone(value) ? null : encodePayloadOptions(value.value)
-  if (Array.isArray(value)) return value.map(encodePayloadOptions)
-  if (value !== null && typeof value === "object" && !isInstance(value) && !isRef(value)) {
-    return Object.fromEntries(Object.entries(value).map(([key, item]) => [key, encodePayloadOptions(item)]))
-  }
-  return value
-}
+// Prefer the declared encoded representation, then support decoded values such
+// as OptionFromNullOr inputs and references to earlier decoded handler results.
+const decodePayload = (rpc: Rpc.AnyWithProps, value: unknown): Effect.Effect<unknown, unknown, any> =>
+  Schema.decodeUnknownEffect(rpc.payloadSchema)(value).pipe(Effect.catch(() =>
+    Schema.encodeUnknownEffect(rpc.payloadSchema)(value).pipe(Effect.flatMap(Schema.decodeUnknownEffect(rpc.payloadSchema)))
+  ))
 
-const encodeTransportValue = (value: unknown, ancestors = new WeakSet<object>()): unknown => {
-  if (Option.isOption(value)) return Option.isNone(value)
-    ? { _id: "Option", _tag: "None" }
-    : { _id: "Option", _tag: "Some", value: encodeTransportValue(value.value, ancestors) }
-  if (typeof value === "number" && !Number.isFinite(value)) return null
-  if (typeof value === "bigint" || typeof value === "symbol") return String(value)
-  if (Array.isArray(value)) {
-    if (ancestors.has(value)) return "[Circular]"
+const encodeTransportValue = (value: unknown): unknown => {
+  const ancestors = new WeakSet<object>()
+  let count = 0
+  const encode = (value: unknown, depth: number): unknown => {
+    if (++count > 100_000 || depth > 64) throw new PipelineProtocolError("Pipeline result structure limit exceeded", "LimitExceeded")
+    if (value === undefined) return { _id: "effect-rpc-pipeline/Undefined" }
+    if (typeof value === "number" && !Number.isFinite(value) || typeof value === "bigint" || typeof value === "symbol" || typeof value === "function") {
+      throw new PipelineProtocolError("Pipeline results must contain JSON data or Option values", "UnsupportedValue")
+    }
+    if (value === null || typeof value !== "object") return value
+    if (ancestors.has(value)) throw new PipelineProtocolError("Cyclic pipeline result", "UnsupportedValue")
     ancestors.add(value)
-    const encoded = value.map((item) => encodeTransportValue(item, ancestors))
-    ancestors.delete(value)
-    return encoded
+    try {
+      if (Option.isOption(value)) return Option.isNone(value)
+        ? { _id: "Option", _tag: "None" }
+        : { _id: "Option", _tag: "Some", value: encode(value.value, depth + 1) }
+      if (Array.isArray(value)) return value.map((item) => encode(item, depth + 1))
+      const tag = Object.prototype.toString.call(value)
+      if (tag !== "[object Object]" && tag !== "[object Error]") throw new PipelineProtocolError("Unsupported pipeline result object", "UnsupportedValue")
+      const entries = Object.entries(value)
+      // Error.message is non-enumerable, including on Schema.TaggedError.
+      if ("_tag" in value && Object.hasOwn(value, "message") && typeof (value as any).message === "string" && !entries.some(([key]) => key === "message")) entries.push(["message", (value as any).message])
+      return Object.fromEntries(entries.map(([key, item]) => [key, encode(item, depth + 1)]))
+    } finally {
+      ancestors.delete(value)
+    }
   }
-  if (value !== null && typeof value === "object") {
-    if (ancestors.has(value)) return "[Circular]"
-    ancestors.add(value)
-    const encoded = Object.fromEntries(Object.entries(value).flatMap(([key, item]) =>
-      item === undefined || typeof item === "function" ? [] : [[key, encodeTransportValue(item, ancestors)]]
-    ))
-    ancestors.delete(value)
-    return encoded
-  }
-  return value
-}
-
-const dependencies = (node: PipelineNode): ReadonlyArray<string> => node.dependencies
-
-const containsItem = (expr: Expr): boolean => {
-  switch (expr._tag) {
-    case "item": return true
-    case "array": return expr.values.some(containsItem)
-    case "object": return expr.entries.some(([, value]) => containsItem(value))
-    default: return false
-  }
+  return encode(value, 0)
 }
 
 const refsIn = (expr: Expr, out = new Set<string>()): Set<string> => {
@@ -223,8 +254,9 @@ const applyMiddleware = (
 interface ExecutionPlan<R extends Rpc.Any> {
   readonly definition: ServerDefinition<R>
   readonly request: PipelineRequest
-  readonly nodeIndex: ReadonlyMap<string, PipelineNode>
   readonly executable: ReadonlyArray<PipelineNode>
+  readonly required: ReadonlyMap<string, ReadonlyArray<string>>
+  readonly regions: ReadonlyMap<string | undefined, ReadonlyArray<PipelineNode>>
   readonly rpcTags: ReadonlyArray<string>
   readonly limits: ExecutionLimits
 }
@@ -232,6 +264,75 @@ interface ExecutionPlan<R extends Rpc.Any> {
 const expressionsFor = (node: PipelineNode): ReadonlyArray<Expr> => node._tag === "map"
   ? [node.source, node.template]
   : node.target === undefined ? [node.payload] : [node.payload, node.target]
+
+const validatePath = (path: ReadonlyArray<string | number>): void => {
+  if (path.some((part) => part === "__proto__" || part === "prototype" || part === "constructor" ||
+    (typeof part === "number" && (!Number.isSafeInteger(part) || part < 0)))) {
+    throw new PipelineProtocolError("Invalid property path", "InvalidPath")
+  }
+}
+
+const scopedWithin = (scope: string | undefined, owner: string, index: ReadonlyMap<string, PipelineNode>): boolean => {
+  while (scope !== undefined) {
+    if (scope === owner) return true
+    scope = index.get(scope)?.scope
+  }
+  return false
+}
+
+// A map waits for external closures and sequencing barriers, while its own
+// template nodes execute separately for each item.
+const requiredFor = (node: PipelineNode, index: ReadonlyMap<string, PipelineNode>): ReadonlyArray<string> => {
+  const refs = new Set([...node.dependencies, ...expressionsFor(node).flatMap((expr) => [...refsIn(expr)])])
+  if (node._tag === "map") {
+    for (const child of index.values()) {
+      if (scopedWithin(child.scope, node.id, index)) {
+        for (const ref of child.dependencies) refs.add(ref)
+        for (const expr of expressionsFor(child)) for (const ref of refsIn(expr)) refs.add(ref)
+      }
+    }
+    for (const ref of refs) if (scopedWithin(index.get(ref)?.scope, node.id, index)) refs.delete(ref)
+  }
+  return [...refs]
+}
+
+const executeRegion = (
+  nodes: ReadonlyArray<PipelineNode>,
+  values: Map<string, unknown>,
+  execute: (node: PipelineNode) => Effect.Effect<void, unknown, any>,
+  required: ReadonlyMap<string, ReadonlyArray<string>>,
+  concurrency: number
+): Effect.Effect<void, unknown, any> => Effect.suspend(() => {
+  const pending = [...nodes]
+  const next = (): Effect.Effect<void, unknown, any> => {
+    if (pending.length === 0) return Effect.void
+    const ready = pending.filter((node) => required.get(node.id)!.every((id) => values.has(id)))
+    if (ready.length === 0) return Effect.fail(new PipelineProtocolError("Unresolved pipeline dependency", "InvalidReference"))
+    for (const node of ready) pending.splice(pending.indexOf(node), 1)
+    return Effect.forEach(ready, execute, { concurrency, discard: true }).pipe(Effect.flatMap(next))
+  }
+  return next()
+})
+
+const decodeRequest = (input: unknown, limits: ExecutionLimits): PipelineRequest => {
+  // Bound the structure before recursive schema decoding or graph traversal.
+  const pending = [{ value: input, depth: 0 }]
+  let count = 0
+  while (pending.length > 0) {
+    const { value, depth } = pending.pop()!
+    if (++count > limits.maxExpressionNodes || depth > limits.maxDepth) throw new PipelineProtocolError("Pipeline structure limit exceeded", "LimitExceeded")
+    if (value !== null && typeof value === "object") {
+      const entries = Object.values(value)
+      if (entries.length + count + pending.length > limits.maxExpressionNodes) throw new PipelineProtocolError("Pipeline structure limit exceeded", "LimitExceeded")
+      for (const child of entries) pending.push({ value: child, depth: depth + 1 })
+    }
+  }
+  try {
+    return Schema.decodeUnknownSync(PipelineRequestSchema)(input)
+  } catch {
+    throw new PipelineProtocolError("Malformed pipeline request", "InvalidPipeline")
+  }
+}
 
 const compilePipeline = <R extends Rpc.Any>(
   group: RpcGroup.RpcGroup<R>,
@@ -246,41 +347,86 @@ const compilePipeline = <R extends Rpc.Any>(
     const nodeIndex = new Map(request.nodes.map((node) => [node.id, node]))
     if (nodeIndex.size !== request.nodes.length) throw new PipelineProtocolError("Duplicate pipeline node id", "InvalidPipeline")
 
+    const ancestors = (scope: string | undefined): Set<string | undefined> => {
+      const out = new Set<string | undefined>([undefined])
+      while (scope !== undefined) {
+        if (out.has(scope)) throw new PipelineProtocolError("Cyclic map scopes", "InvalidReference")
+        out.add(scope)
+        if (out.size > limits.maxDepth) throw new PipelineProtocolError("Map scope depth limit exceeded", "LimitExceeded")
+        const owner = nodeIndex.get(scope)
+        if (owner?._tag !== "map") throw new PipelineProtocolError("Unknown map scope", "InvalidReference")
+        scope = owner.scope
+      }
+      return out
+    }
+    const validateExpression = (expr: Expr, scope: string | undefined): void => {
+      const allowed = ancestors(scope)
+      const visit = (expression: Expr): void => {
+        if (expression._tag === "ref") {
+          const referenced = nodeIndex.get(expression.id)
+          if (!referenced || !allowed.has(referenced.scope)) throw new PipelineProtocolError(`Out-of-scope or unknown ref ${expression.id}`, "InvalidReference")
+          validatePath(expression.path)
+        } else if (expression._tag === "item") {
+          if (!allowed.has(expression.scope)) throw new PipelineProtocolError("Map item escaped its scope", "InvalidReference")
+          validatePath(expression.path)
+        } else if (expression._tag === "array") expression.values.forEach(visit)
+        else if (expression._tag === "object") expression.entries.forEach(([, value]) => visit(value))
+        else if (expression._tag === "some") visit(expression.value)
+      }
+      visit(expr)
+    }
     for (const node of request.nodes) {
-      for (const expression of expressionsFor(node)) {
-        for (const ref of refsIn(expression)) {
-          if (!nodeIndex.has(ref)) throw new PipelineProtocolError(`Unknown ref ${ref}`, "InvalidReference")
+      const allowed = ancestors(node.scope)
+      for (const dependency of node.dependencies) {
+        const referenced = nodeIndex.get(dependency)
+        if (!referenced || !allowed.has(referenced.scope)) throw new PipelineProtocolError(`Unknown or out-of-scope dependency ${dependency}`, "InvalidReference")
+      }
+      if (node._tag === "call") {
+        validateExpression(node.payload, node.scope)
+        if (node.target !== undefined) validateExpression(node.target, node.scope)
+        else {
+          const rpc = group.requests.get(node.method) as Rpc.AnyWithProps | undefined
+          if (!rpc) throw new PipelineProtocolError(`Unknown RPC ${node.method}`, "UnknownMethod")
+          if (RpcSchema.isStreamSchema(rpc.successSchema)) throw new PipelineProtocolError("Streaming RPCs are not supported in pipelines", "UnsupportedRpc")
+        }
+      } else {
+        validateExpression(node.source, node.scope)
+        validateExpression(node.template, node.id)
+      }
+    }
+    validateExpression(request.selection, undefined)
+    for (const id of request.discards) {
+      if (!nodeIndex.has(id) || nodeIndex.get(id)!.scope !== undefined) throw new PipelineProtocolError(`Invalid discarded ref ${id}`, "InvalidReference")
+    }
+    // Resolve lexical dependencies once, rather than scanning descendants in
+    // every scheduling wave and every mapped template invocation.
+    const required = new Map(request.nodes.map((node) => [node.id, requiredFor(node, nodeIndex)]))
+    const regions = new Map<string | undefined, Array<PipelineNode>>()
+    for (const node of request.nodes) {
+      const region = regions.get(node.scope)
+      if (region === undefined) regions.set(node.scope, [node])
+      else region.push(node)
+    }
+    // Validate every lexical region before invoking any handler.
+    for (const scope of new Set([undefined, ...request.nodes.filter((node) => node._tag === "map").map((node) => node.id)])) {
+      const remaining = [...(regions.get(scope) ?? [])]
+      const resolved = new Set<string>()
+      while (remaining.length > 0) {
+        const ready = remaining.filter((node) => required.get(node.id)!.every((id) => nodeIndex.get(id)?.scope !== scope || resolved.has(id)))
+        if (ready.length === 0) throw new PipelineProtocolError("Pipeline contains a cycle or unresolved dependency", "InvalidReference")
+        for (const node of ready) {
+          remaining.splice(remaining.indexOf(node), 1)
+          resolved.add(node.id)
         }
       }
-      for (const dependency of dependencies(node)) {
-        if (!nodeIndex.has(dependency)) throw new PipelineProtocolError(`Unknown dependency ${dependency}`, "InvalidReference")
-      }
     }
-    for (const ref of refsIn(request.selection)) {
-      if (!nodeIndex.has(ref)) throw new PipelineProtocolError(`Unknown selection ref ${ref}`, "InvalidReference")
-    }
-
-    const executable = request.nodes.filter((node) => !(
-      node._tag === "call" && (containsItem(node.payload) || (node.target ? containsItem(node.target) : false))
-    ))
-    const remaining = [...executable]
-    const resolved = new Set<string>()
-    while (remaining.length > 0) {
-      const ready = remaining.filter((node) => {
-        const required = node._tag === "map" ? [...refsIn(node.source)] : dependencies(node)
-        return required.every((id) => resolved.has(id))
-      })
-      if (ready.length === 0) throw new PipelineProtocolError("Pipeline contains a cycle or unresolved dependency", "InvalidReference")
-      for (const node of ready) {
-        remaining.splice(remaining.indexOf(node), 1)
-        resolved.add(node.id)
-      }
-    }
+    const executable = regions.get(undefined) ?? []
 
     return {
       definition,
       request,
-      nodeIndex,
+      required,
+      regions,
       executable,
       rpcTags: [...new Set(request.nodes.filter((node): node is Extract<PipelineNode, { readonly _tag: "call" }> => node._tag === "call").map((node) => node.method))],
       limits
@@ -292,32 +438,35 @@ const compilePipeline = <R extends Rpc.Any>(
 })
 
 const executeNode = <R extends Rpc.Any>(
-  definition: ServerDefinition<R>,
+  plan: ExecutionPlan<R>,
   node: PipelineNode,
   values: Map<string, unknown>,
   context: Context.Context<any>,
   metadata: RequestMetadata,
   middleware: ReadonlyArray<Middleware<any, any>>,
   executionContext: ExecutionContext<R>,
-  invocationSequence: { value: number },
-  limits: ExecutionLimits,
-  item?: unknown,
-  nodeIndex: ReadonlyMap<string, PipelineNode> = new Map()
-): Effect.Effect<void, unknown, any> => {
-  const required = node._tag === "map" ? [...refsIn(node.source)] : dependencies(node)
+  invocationSequence: { value: number; readonly permits: Semaphore.Semaphore; readonly work: ExecutionWork },
+  items: ReadonlyMap<string, unknown> = new Map()
+): Effect.Effect<void, unknown, any> => invocationSequence.work.step.pipe(Effect.flatMap(() => {
+  const { definition, limits } = plan
+  const work = invocationSequence.work
+  const required = plan.required.get(node.id)!
   for (const dependency of required) if (!values.has(dependency)) return Effect.fail(new PipelineProtocolError(`Unresolved dependency ${dependency}`, "InvalidReference"))
   if (node._tag === "map") {
-    return Effect.try({ try: () => evalExpr(node.source, values), catch: (error) => error }).pipe(
+    return Effect.try({ try: () => evalExpr(node.source, values, items, work), catch: (error) => error }).pipe(
       Effect.flatMap((source) => {
         const run = (item: unknown) => Effect.gen(function*() {
+          yield* work.step
           const itemValues = new Map(values)
-          for (const ref of refsIn(node.template)) {
-            const child = nodeIndex.get(ref)
-            if (child && (!itemValues.has(ref) || (child._tag === "call" && (containsItem(child.payload) || (child.target ? containsItem(child.target) : false))))) {
-              yield* executeNode(definition, child, itemValues, context, metadata, middleware, executionContext, invocationSequence, limits, item, nodeIndex)
-            }
-          }
-          return yield* Effect.try({ try: () => evalExpr(node.template, itemValues, item), catch: (error) => error })
+          const itemBindings = new Map(items).set(node.id, item)
+          yield* executeRegion(
+            plan.regions.get(node.id) ?? [],
+            itemValues,
+            (child) => executeNode(plan, child, itemValues, context, metadata, middleware, executionContext, invocationSequence, itemBindings),
+            plan.required,
+            limits.concurrency
+          )
+          return yield* Effect.try({ try: () => evalExpr(node.template, itemValues, itemBindings, work), catch: (error) => error })
         })
         if (Array.isArray(source)) {
           if (source.length > limits.maxMapItems) return Effect.fail(new PipelineProtocolError("Pipeline map item limit exceeded", "LimitExceeded"))
@@ -328,12 +477,14 @@ const executeNode = <R extends Rpc.Any>(
       })
     )
   }
-  return Effect.try({ try: () => evalExpr(node.payload, values, item), catch: (error) => error }).pipe(
-    Effect.flatMap((rawPayload) => {
+  return Effect.try({ try: () => ({
+    rawPayload: evalExpr(node.payload, values, items, work),
+    rawTarget: node.target ? evalExpr(node.target, values, items, work) : undefined
+  }), catch: (error) => error }).pipe(
+    Effect.flatMap(({ rawPayload, rawTarget }) => {
       const duplex = Context.getOrUndefined(context, Duplex.Server)
       const resolvedPayload = duplex === undefined ? rawPayload : Duplex.resolveServerValue(duplex, metadata.client.id, rawPayload)
-      const payload = encodePayloadOptions(resolvedPayload)
-      const rawTarget = node.target ? evalExpr(node.target, values, item) : undefined
+      const payload = resolvedPayload
       const target = duplex === undefined ? rawTarget : Duplex.resolveServerValue(duplex, metadata.client.id, rawTarget)
       if (target !== undefined && !isInstance(target)) return Effect.fail(new PipelineProtocolError("Call target is not a capability", "InvalidTarget"))
       if (target !== undefined) {
@@ -342,7 +493,7 @@ const executeNode = <R extends Rpc.Any>(
         if (!rpc) return Effect.fail(new PipelineProtocolError(`Unknown capability method ${node.method}`, "UnknownMethod"))
         const capabilityContext = Context.merge(context, instance.context)
         const invocation = Effect.gen(function*() {
-          const decodedPayload = yield* Schema.decodeUnknownEffect(rpc.payloadSchema)(payload)
+          const decodedPayload = yield* decodePayload(rpc, payload)
           const access = yield* instance.group.accessHandler(node.method)
           const nodeMetadata = { ...metadata, requestId: `${String(metadata.requestId)}/${node.id}`, rpc, payload: decodedPayload } as any
           const invoked = (access as any)(decodedPayload, nodeMetadata)
@@ -363,12 +514,12 @@ const executeNode = <R extends Rpc.Any>(
           invocation: invocationSequence.value++,
           kind: "capability",
           rpc
-        }).pipe(Effect.provideContext(capabilityContext))
+        }).pipe(Effect.provideContext(capabilityContext), invocationSequence.permits.withPermit)
       }
       const rpc = definition.root.requests.get(node.method) as Rpc.AnyWithProps | undefined
       if (!rpc) return Effect.fail(new PipelineProtocolError(`Unknown RPC ${node.method}`, "UnknownMethod"))
       const invocation = Effect.gen(function*() {
-        const decodedPayload = yield* Schema.decodeUnknownEffect(rpc.payloadSchema)(payload)
+        const decodedPayload = yield* decodePayload(rpc, payload)
         const access = yield* definition.root.accessHandler(node.method)
         const nodeMetadata = { ...metadata, requestId: `${String(metadata.requestId)}/${node.id}`, rpc, payload: decodedPayload } as any
         const invoked = (access as any)(decodedPayload, nodeMetadata)
@@ -389,10 +540,10 @@ const executeNode = <R extends Rpc.Any>(
         invocation: invocationSequence.value++,
         kind: "root",
         rpc
-      }).pipe(Effect.provideContext(context))
+      }).pipe(Effect.provideContext(context), invocationSequence.permits.withPermit)
     })
   )
-}
+}))
 
 const executePipeline = <R extends Rpc.Any>(
   plan: ExecutionPlan<R>,
@@ -402,35 +553,17 @@ const executePipeline = <R extends Rpc.Any>(
   executionContext: ExecutionContext<R>
 ): Effect.Effect<unknown, unknown, never> => {
   const values = new Map<string, unknown>()
-  const pending = [...plan.executable]
-  const invocationSequence = { value: 0 }
-  const executeReady = (): Effect.Effect<void, unknown, any> => {
-    if (pending.length === 0) return Effect.void
-    const ready = pending.filter((node) => {
-      const required = node._tag === "map" ? [...refsIn(node.source)] : dependencies(node)
-      return required.every((id) => values.has(id))
-    })
-    if (ready.length === 0) return Effect.fail(new PipelineProtocolError("Pipeline contains a cycle or unresolved dependency", "InvalidReference"))
-    for (const node of ready) pending.splice(pending.indexOf(node), 1)
-    return Effect.forEach(ready, (node) => executeNode(
-      plan.definition,
-      node,
-      values,
-      context,
-      metadata,
-      middleware,
-      executionContext,
-      invocationSequence,
-      plan.limits,
-      undefined,
-      plan.nodeIndex
-    ), {
-      concurrency: plan.limits.concurrency
-    }).pipe(Effect.flatMap(executeReady), Effect.asVoid)
-  }
-  return executeReady().pipe(
+  const work = makeExecutionWork(plan.limits.maxExecutionSteps)
+  const invocationSequence = { value: 0, permits: Semaphore.makeUnsafe(plan.limits.concurrency), work }
+  return executeRegion(
+    plan.executable,
+    values,
+    (node) => executeNode(plan, node, values, context, metadata, middleware, executionContext, invocationSequence),
+    plan.required,
+    plan.limits.concurrency
+  ).pipe(
     Effect.flatMap(() => Effect.try({
-      try: () => evalExpr(plan.request.selection, values),
+      try: () => evalExpr(plan.request.selection, values, new Map(), work),
       catch: (error) => error
     }))
   ) as Effect.Effect<unknown, unknown, never>
@@ -452,42 +585,51 @@ const handleWithContext = <R extends Rpc.Any, M extends ReadonlyArray<Middleware
   context: Context.Context<Requirements<R> | MiddlewaresRequirements<M>>,
   metadata: RequestMetadata,
   options?: ServerOptions<M>
-): Effect.Effect<PipelineResponse, never, never> => {
+): Effect.Effect<PipelineResponse, never, never> => Effect.suspend(() => {
+  try {
+    request = decodeRequest(request, executionLimits(options))
+  } catch (error) {
+    const failure = error instanceof PipelineProtocolError ? error : new PipelineProtocolError("Malformed pipeline request")
+    return Effect.succeed({ _tag: "Failure" as const, error: encodeTransportValue(failure) })
+  }
   const scopedContext = Context.add(context, RequestScope, makeScope())
   const middleware = options?.middleware ?? []
-  const requestContext: RequestContext<R> = { group, request, metadata }
-  const wrapped = applyMiddleware(
-    middleware,
-    "request",
-    Effect.flatMap(
-      compilePipeline(group, request, options),
-      (plan) => {
-        const executionContext: ExecutionContext<R> = { ...requestContext, rpcTags: plan.rpcTags }
-        return applyMiddleware(
-          middleware,
-          "execution",
-          executePipeline(plan, scopedContext, metadata, middleware, executionContext),
-          executionContext
-        )
-      }
-    ),
-    requestContext
-  )
-  return wrapped.pipe(
-    Effect.provideContext(scopedContext),
-    Effect.flatMap((value): Effect.Effect<PipelineResponse, PipelineProtocolError> => {
+  const requestContext: RequestContext<R> = { definitionId: options?.id ?? "default", group, request, metadata }
+  const program = Effect.flatMap(
+    compilePipeline(group, request, options),
+    (plan) => {
+      const executionContext: ExecutionContext<R> = { ...requestContext, rpcTags: plan.rpcTags }
+      return applyMiddleware(
+        middleware,
+        "execution",
+        executePipeline(plan, scopedContext, metadata, middleware, executionContext),
+        executionContext
+      )
+    }
+  ).pipe(Effect.flatMap((value): Effect.Effect<PipelineResponse, PipelineProtocolError> => Effect.try({
+    try: () => {
       const duplex = Context.getOrUndefined(scopedContext, Duplex.Server)
       if (duplex === undefined && containsCapability(value)) {
-        return Effect.fail(new PipelineProtocolError("Capabilities require the WebSocket duplex transport", "UnsupportedRpc"))
+        throw new PipelineProtocolError("Capabilities require the WebSocket duplex transport", "UnsupportedRpc")
       }
-      return Effect.succeed({
-        _tag: "Success",
+      return {
+        _tag: "Success" as const,
         value: encodeTransportValue(duplex === undefined ? value : Duplex.encodeServerValue(duplex, metadata.client.id, value))
-      })
-    }),
-    Effect.catch((error): Effect.Effect<PipelineResponse> => Effect.succeed({ _tag: "Failure", error: encodeTransportValue(error) }))
+      }
+    },
+    catch: (error) => error instanceof PipelineProtocolError ? error : new PipelineProtocolError("Pipeline result could not be serialized", "UnsupportedValue")
+  })))
+  return applyMiddleware(middleware, "request", program, requestContext).pipe(
+    Effect.provideContext(scopedContext),
+    Effect.catch((error): Effect.Effect<PipelineResponse> => Effect.sync(() => {
+      try {
+        return { _tag: "Failure", error: encodeTransportValue(error) }
+      } catch {
+        return { _tag: "Failure", error: encodeTransportValue(new PipelineExecutionError({ message: "Pipeline failure could not be serialized", code: "InvalidFailure", retryable: false })) }
+      }
+    }))
   ) as Effect.Effect<PipelineResponse, never, never>
-}
+})
 
 /** Executes a pipeline using normal Effect RPC handlers and middleware from the environment. */
 export const handle = <R extends Rpc.Any, const M extends ReadonlyArray<Middleware<any, any>> = readonly []>(
@@ -502,7 +644,12 @@ export const handle = <R extends Rpc.Any, const M extends ReadonlyArray<Middlewa
   }, options)
 ))
 
-export const augment = <R extends Rpc.Any>(group: RpcGroup.RpcGroup<R>): RpcGroup.RpcGroup<R | typeof PipelineRpc> => group.add(PipelineRpc)
+export const augment = <R extends Rpc.Any>(group: RpcGroup.RpcGroup<R>): RpcGroup.RpcGroup<R | typeof PipelineRpc> => {
+  for (const tag of group.requests.keys()) {
+    if (tag === "then" || tag.startsWith("__effect_rpc_pipeline_")) throw new Error(`RPC tag "${tag}" is reserved`)
+  }
+  return group.add(PipelineRpc)
+}
 
 export const augmentDuplex = <R extends Rpc.Any>(group: RpcGroup.RpcGroup<R>) => augment(group)
   .add(Duplex.SessionRpc)

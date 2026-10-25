@@ -3,13 +3,13 @@ import * as Effectable from "effect/Effectable"
 import * as Option from "effect/Option"
 import * as Schema from "effect/Schema"
 import type * as Stream from "effect/Stream"
-import type * as Rpc from "effect/unstable/rpc/Rpc"
-import type * as RpcGroup from "effect/unstable/rpc/RpcGroup"
-import type * as RpcMiddleware from "effect/unstable/rpc/RpcMiddleware"
-import type * as RpcClient from "effect/unstable/rpc/RpcClient"
-import type { RpcClientError } from "effect/unstable/rpc/RpcClientError"
-import * as RpcSchema from "effect/unstable/rpc/RpcSchema"
-import type * as Headers from "effect/unstable/http/Headers"
+import type * as Rpc from "effect/rpc/Rpc"
+import type * as RpcGroup from "effect/rpc/RpcGroup"
+import type * as RpcMiddleware from "effect/rpc/RpcMiddleware"
+import type * as RpcClient from "effect/rpc/RpcClient"
+import type { RpcClientError } from "effect/rpc/RpcClientError"
+import * as RpcSchema from "effect/rpc/RpcSchema"
+import type * as Headers from "effect/http/Headers"
 import { CapabilityGroupTypeId } from "./Capability.js"
 
 export const PipelineRefTypeId = Symbol.for("effect-rpc-pipeline/PipelineRef")
@@ -32,14 +32,14 @@ export class PipelineExecutionError extends Schema.TaggedError<PipelineExecution
 export type Expr =
   | { readonly _tag: "literal"; readonly value?: unknown }
   | { readonly _tag: "ref"; readonly id: string; readonly path: ReadonlyArray<string | number> }
-  | { readonly _tag: "item"; readonly path: ReadonlyArray<string | number> }
+  | { readonly _tag: "item"; readonly scope: string; readonly path: ReadonlyArray<string | number> }
   | { readonly _tag: "array"; readonly values: ReadonlyArray<Expr> }
   | { readonly _tag: "object"; readonly entries: ReadonlyArray<readonly [string, Expr]> }
   | { readonly _tag: "none" }
   | { readonly _tag: "some"; readonly value: Expr }
 
-export type CallNode = { readonly _tag: "call"; readonly id: string; readonly target?: Expr; readonly method: string; readonly payload: Expr; readonly dependencies: ReadonlyArray<string> }
-export type MapNode = { readonly _tag: "map"; readonly id: string; readonly source: Expr; readonly template: Expr; readonly dependencies: ReadonlyArray<string> }
+export type CallNode = { readonly _tag: "call"; readonly id: string; readonly scope?: string; readonly target?: Expr; readonly method: string; readonly payload: Expr; readonly dependencies: ReadonlyArray<string> }
+export type MapNode = { readonly _tag: "map"; readonly id: string; readonly scope?: string; readonly source: Expr; readonly template: Expr; readonly dependencies: ReadonlyArray<string> }
 export type PipelineNode = CallNode | MapNode
 export type PipelineRequest = { readonly version: 1; readonly definitionId: string; readonly nodes: ReadonlyArray<PipelineNode>; readonly selection: Expr; readonly discards: ReadonlyArray<string> }
 export type PipelineTransport = (request: PipelineRequest, options?: { readonly headers: Headers.Headers }) => Effect.Effect<
@@ -50,6 +50,7 @@ export type PipelineTransport = (request: PipelineRequest, options?: { readonly 
 >
 
 type Runtime = {
+  scope: string | undefined
   readonly definitionId: string
   readonly execute: (request: PipelineRequest) => Effect.Effect<unknown, unknown, never>
   readonly encodeLiteral?: (value: unknown) => unknown
@@ -66,10 +67,17 @@ type MiddlewareClientError<R extends Rpc.Any> = R extends Rpc.Rpc<any, any, any,
 /** A remote value that composes without I/O and is also a normal Effect when yielded. */
 export type Remote<A, E = unknown, R = never> = Effect.Effect<A, E, R> & { readonly [PipelineRefTypeId]: true; readonly readonlyType?: A } & CapabilityClient<A, E, R> & RemoteFields<A, E, R>
 export type PipelineOperation<A, E = unknown, R = never> = Remote<A, E, R>
+/** Finite pipelines return data fields; class methods and prototypes do not cross the wire. */
+export type Data<A> = A extends { readonly [CapabilityGroupTypeId]: unknown } ? A
+  : A extends Option.Option<infer I> ? Option.Option<Data<I>>
+  : A extends ReadonlyArray<unknown> ? { readonly [K in keyof A]: Data<A[K]> }
+  : A extends Date | ReadonlyMap<any, any> | ReadonlySet<any> ? never
+  : A extends object ? { readonly [K in keyof A as A[K] extends (...args: any[]) => any ? never : K]: Data<A[K]> }
+  : A
 type PipelineMethod<R extends Rpc.Any, E, Env> = <const Input extends PipelineInput<Rpc.PayloadConstructor<R>> = Rpc.PayloadConstructor<R>>(
   ...args: undefined extends Rpc.PayloadConstructor<R> ? readonly [input?: Input] : readonly [input: Input]
 ) => Remote<
-  Rpc.Success<R>,
+  Data<Rpc.Success<R>>,
   Rpc.Error<R> | MiddlewareClientError<R> | E | ErrorsIn<Input>,
   Rpc.ServicesClient<R> | Env | ServicesIn<Input>
 >
@@ -121,15 +129,24 @@ const mergeNodes = (...graphs: ReadonlyArray<Graph>): ReadonlyArray<PipelineNode
   return [...nodes.values()]
 }
 const assertRuntime = (runtime: Runtime, graph: Graph) => { if (runtime !== graph.runtime) throw new Error("Remote values from different pipeline clients cannot be combined") }
-const encodeValue = (value: unknown, runtime: Runtime, graphs: Graph[]): Expr => {
+const encodeValue = (value: unknown, runtime: Runtime, graphs: Graph[], depth = 0, ancestors = new WeakSet<object>()): Expr => {
+  if (depth > 64) throw new TypeError("Pipeline input exceeds the maximum structure depth")
   if (isOperation(value)) { assertRuntime(runtime, value.graph); graphs.push(value.graph); return value.graph.selection }
-  if (Option.isOption(value)) return Option.isNone(value) ? { _tag: "none" } : { _tag: "some", value: encodeValue(value.value, runtime, graphs) }
-  if (Array.isArray(value)) return { _tag: "array", values: value.map((item) => encodeValue(item, runtime, graphs)) }
+  if (Option.isOption(value)) return Option.isNone(value) ? { _tag: "none" } : { _tag: "some", value: encodeValue(value.value, runtime, graphs, depth + 1, ancestors) }
   if (value !== null && typeof value === "object") {
     const encoded = runtime.encodeLiteral?.(value)
     if (encoded !== undefined && encoded !== value) return { _tag: "literal", value: encoded }
-    return { _tag: "object", entries: Object.keys(value).map((key) => [key, encodeValue((value as any)[key], runtime, graphs)] as const) }
+    if (ancestors.has(value)) throw new TypeError("Pipeline inputs cannot contain cycles")
+    ancestors.add(value)
+    try {
+      if (Array.isArray(value)) return { _tag: "array", values: value.map((item) => encodeValue(item, runtime, graphs, depth + 1, ancestors)) }
+      if (Object.prototype.toString.call(value) !== "[object Object]") throw new TypeError("Pipeline inputs must contain JSON data or Option values")
+      return { _tag: "object", entries: Object.keys(value).map((key) => [key, encodeValue((value as any)[key], runtime, graphs, depth + 1, ancestors)] as const) }
+    } finally {
+      ancestors.delete(value)
+    }
   }
+  if (typeof value === "function" || typeof value === "symbol" || typeof value === "bigint" || typeof value === "number" && !Number.isFinite(value)) throw new TypeError("Unsupported pipeline input value")
   const encoded = runtime.encodeLiteral?.(value) ?? value
   return encoded === undefined ? { _tag: "literal" } : { _tag: "literal", value: encoded }
 }
@@ -156,12 +173,18 @@ const makeRemote = <A, E = unknown, R = never>(graph: Graph): Remote<A, E, R> =>
     [PipelineRefTypeId]: true as const,
     graph
   })
+  // Function metadata must not shadow fields returned by an RPC.
+  Reflect.deleteProperty(operation, "name")
+  Reflect.deleteProperty(operation, "length")
   Object.setPrototypeOf(operation, OperationProto)
   return new Proxy(operation as any, {
     get(target, property, receiver) {
       if (property === OperationTypeId || property === PipelineRefTypeId || property === "graph") return Reflect.get(target, property, receiver)
       if (property === "then") return undefined
-      if (typeof property === "symbol" || property in target) {
+      // Effect uses string protocol keys too (including its Exit marker).
+      // Synthesizing a remote for an absent key makes ordinary operations look
+      // like completed Exits to concurrent Effect combinators.
+      if (typeof property === "symbol" || property.startsWith("~effect/") || property in target) {
         const value = Reflect.get(target, property, receiver)
         return typeof value === "function" ? value.bind(property === "pipe" ? receiver : target) : value
       }
@@ -176,7 +199,7 @@ const makeRemote = <A, E = unknown, R = never>(graph: Graph): Remote<A, E, R> =>
       const extra: Graph[] = []
       const payload = encodeValue(args.length === 0 ? undefined : args.length === 1 ? args[0] : args, graph.runtime, extra)
       const id = graph.runtime.nextId()
-      const node: CallNode = { _tag: "call", id, target, method, payload, dependencies: [...new Set([...refsIn(target), ...refsIn(payload)])] }
+      const node: CallNode = { _tag: "call", id, ...(graph.runtime.scope === undefined ? {} : { scope: graph.runtime.scope }), target, method, payload, dependencies: [...new Set([...refsIn(target), ...refsIn(payload)])] }
       return makeRemote({ runtime: graph.runtime, nodes: [...mergeNodes(graph, ...extra), node], selection: { _tag: "ref", id, path: [] }, discards: [] })
     }
   })
@@ -191,8 +214,12 @@ export const makeClient = <Rpcs extends Rpc.Any>(
     readonly encodeLiteral?: Runtime["encodeLiteral"]
   }
 ): ClientApi<Rpcs> => {
+  for (const tag of group.requests.keys()) {
+    if (tag === "then" || tag.startsWith("__effect_rpc_pipeline_")) throw new Error(`RPC tag "${tag}" is reserved`)
+  }
   let sequence = 0
   const runtime: Runtime = {
+    scope: undefined,
     definitionId,
     execute,
     ...(options?.encodeLiteral === undefined ? {} : { encodeLiteral: options.encodeLiteral }),
@@ -211,7 +238,7 @@ export const makeClient = <Rpcs extends Rpc.Any>(
         const extra: Graph[] = []
         const payload = encodeValue(input, runtime, extra)
         const id = runtime.nextId()
-        const node: CallNode = { _tag: "call", id, method: property, payload, dependencies: [...refsIn(payload)] }
+        const node: CallNode = { _tag: "call", id, ...(runtime.scope === undefined ? {} : { scope: runtime.scope }), method: property, payload, dependencies: [...refsIn(payload)] }
         return makeRemote({ runtime, nodes: [...mergeNodes(...extra), node], selection: { _tag: "ref", id, path: [] }, discards: [] })
       }
     }
@@ -240,11 +267,18 @@ export function map<A, B, E, R>(source: Remote<Option.Option<A>, E, R>, mapper: 
 export function map(source: Remote<any, any, any>, mapper: (item: Remote<any, never, never>) => unknown): Remote<any, any, any> {
   if (!isOperation(source)) throw new Error("Pipeline.map requires a remote array or Option")
   const sourceGraph = source.graph
-  const placeholder = makeRemote<any, never, never>({ runtime: sourceGraph.runtime, nodes: [], selection: { _tag: "item", path: [] }, discards: [] })
-  const extra: Graph[] = []
-  const template = encodeValue(mapper(placeholder), sourceGraph.runtime, extra)
   const id = sourceGraph.runtime.nextId()
-  const node: MapNode = { _tag: "map", id, source: sourceGraph.selection, template, dependencies: [...new Set([...refsIn(sourceGraph.selection), ...refsIn(template)])] }
+  const scope = sourceGraph.runtime.scope
+  const placeholder = makeRemote<any, never, never>({ runtime: sourceGraph.runtime, nodes: [], selection: { _tag: "item", scope: id, path: [] }, discards: [] })
+  const extra: Graph[] = []
+  let template: Expr
+  sourceGraph.runtime.scope = id
+  try {
+    template = encodeValue(mapper(placeholder), sourceGraph.runtime, extra)
+  } finally {
+    sourceGraph.runtime.scope = scope
+  }
+  const node: MapNode = { _tag: "map", id, ...(scope === undefined ? {} : { scope }), source: sourceGraph.selection, template, dependencies: [...refsIn(sourceGraph.selection)] }
   return makeRemote({ runtime: sourceGraph.runtime, nodes: [...mergeNodes(sourceGraph, ...extra), node], selection: { _tag: "ref", id, path: [] }, discards: [] })
 }
 
@@ -278,7 +312,10 @@ export function andThen(
   const graphs: Graph[] = []
   const selection = encodeValue(selected, self.graph.runtime, graphs)
   const priorNodeIds = new Set(self.graph.nodes.map((node) => node.id))
-  const barriers = refsIn(self.graph.selection)
+  const barriers = new Set([
+    ...refsIn(self.graph.selection),
+    ...self.graph.nodes.filter((node) => node.scope === self.graph.runtime.scope).map((node) => node.id)
+  ])
   const nodes = mergeNodes(self.graph, ...graphs).map((node) =>
     priorNodeIds.has(node.id)
       ? node
@@ -298,3 +335,9 @@ export const zipRight = <A, B, E, E2, R, R2>(left: Remote<A, E, R>, right: Remot
 
 export const isPipelineRef = isOperation
 export const isOption = Option.isOption
+
+/** Projects a field explicitly, including names reserved by Effect or JavaScript. */
+export const field = <A, E, R, K extends keyof A>(self: Remote<A, E, R>, key: K): Remote<A[K], E, R> => {
+  if (!isOperation(self)) throw new Error("Pipeline.field requires a remote operation")
+  return makeRemote({ ...self.graph, selection: project(self.graph.selection, String(key)) })
+}

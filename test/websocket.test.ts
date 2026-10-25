@@ -8,12 +8,12 @@ import * as Option from "effect/Option"
 import * as PubSub from "effect/PubSub"
 import * as Schema from "effect/Schema"
 import * as Stream from "effect/Stream"
-import * as HttpRouter from "effect/unstable/http/HttpRouter"
-import * as HttpServer from "effect/unstable/http/HttpServer"
-import * as Rpc from "effect/unstable/rpc/Rpc"
-import * as RpcGroup from "effect/unstable/rpc/RpcGroup"
-import * as RpcSerialization from "effect/unstable/rpc/RpcSerialization"
-import * as Socket from "effect/unstable/socket/Socket"
+import * as HttpRouter from "effect/http/HttpRouter"
+import * as HttpServer from "effect/http/HttpServer"
+import * as Rpc from "effect/rpc/Rpc"
+import * as RpcGroup from "effect/rpc/RpcGroup"
+import * as RpcSerialization from "effect/rpc/RpcSerialization"
+import * as Socket from "effect/socket/Socket"
 import { createServer } from "node:http"
 import { describe, expect, it } from "vitest"
 import * as Capability from "../src/Capability.js"
@@ -85,7 +85,7 @@ describe("native Effect WebSocket transport", () => {
       )
       const serverContext = yield* Layer.build(ServerLive as Layer.Layer<HttpServer.HttpServer, unknown>)
       const server = Context.get(serverContext, HttpServer.HttpServer)
-      if (server.address._tag !== "TcpAddress") return yield* Effect.die("Expected TCP test server")
+      if (server.address._tag === "UnixPathAddress") return yield* Effect.die("Expected TCP test server")
       const httpUrl = `http://127.0.0.1:${server.address.port}/rpc`
       const url = `ws://127.0.0.1:${server.address.port}/rpc`
 

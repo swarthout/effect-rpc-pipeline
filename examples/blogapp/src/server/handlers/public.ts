@@ -21,6 +21,12 @@ export const makePublicHandlers = Effect.fn("makePublicHandlers")(function*(chan
     getPost: ({ slug }: { slug: string }) => database.getPublishedPostBySlug(slug),
     getUser: ({ id }: { id: string }) => lookups.userById(id),
     listComments: ({ postId }: { postId: string }) => database.listComments(postId),
-    watchPost: ({ postId }: { postId: string }) => Stream.fromPubSub(changes).pipe(Stream.filter((change) => change.postId === postId))
+    watchPost: ({ postId }: { postId: string }) => Stream.fromPubSub(changes).pipe(
+      Stream.filter((change) => change.postId === postId),
+      Stream.filterEffect(() => database.getPostById(postId).pipe(
+        Effect.map((post) => post.status === "Published"),
+        Effect.catch(() => Effect.succeed(false))
+      ))
+    )
   }
 })

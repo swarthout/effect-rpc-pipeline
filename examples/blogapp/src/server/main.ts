@@ -2,7 +2,7 @@ import { NodeHttpServer, NodeRuntime } from "@effect/platform-node"
 import { createServer } from "node:http"
 import { mkdirSync } from "node:fs"
 import * as Layer from "effect/Layer"
-import * as HttpRouter from "effect/unstable/http/HttpRouter"
+import * as HttpRouter from "effect/http/HttpRouter"
 import { makeBlogLayers } from "./layers.js"
 
 mkdirSync(new URL("../../.data", import.meta.url), { recursive: true })

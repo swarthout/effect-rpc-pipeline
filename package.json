@@ -7,71 +7,105 @@
   "sideEffects": false,
   "files": [
     "dist",
+    "src",
+    "docs",
     "README.md",
-    "LICENSE"
+    "CHANGELOG.md",
+    "LICENSE",
+    "CONTRIBUTING.md",
+    "SECURITY.md"
   ],
-  "main": "./dist/index.mjs",
-  "types": "./dist/index.d.mts",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
   "exports": {
     ".": {
-      "types": "./dist/index.d.mts",
-      "import": "./dist/index.mjs"
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
     },
     "./Pipeline": {
-      "types": "./dist/Pipeline.d.mts",
-      "import": "./dist/Pipeline.mjs"
+      "types": "./dist/Pipeline.d.ts",
+      "import": "./dist/Pipeline.js"
     },
     "./PipelineClient": {
-      "types": "./dist/PipelineClient.d.mts",
-      "import": "./dist/PipelineClient.mjs"
+      "types": "./dist/PipelineClient.d.ts",
+      "import": "./dist/PipelineClient.js"
     },
     "./PipelineServer": {
-      "types": "./dist/PipelineServer.d.mts",
-      "import": "./dist/PipelineServer.mjs"
+      "types": "./dist/PipelineServer.d.ts",
+      "import": "./dist/PipelineServer.js"
     },
     "./Capability": {
-      "types": "./dist/Capability.d.mts",
-      "import": "./dist/Capability.mjs"
+      "types": "./dist/Capability.d.ts",
+      "import": "./dist/Capability.js"
     },
     "./Duplex": {
-      "types": "./dist/Duplex.d.mts",
-      "import": "./dist/Duplex.mjs"
+      "types": "./dist/Duplex.d.ts",
+      "import": "./dist/Duplex.js"
     },
     "./Auth": {
-      "types": "./dist/Auth.d.mts",
-      "import": "./dist/Auth.mjs"
+      "types": "./dist/Auth.d.ts",
+      "import": "./dist/Auth.js"
     },
     "./RequestBatching": {
-      "types": "./dist/RequestBatching.d.mts",
-      "import": "./dist/RequestBatching.mjs"
+      "types": "./dist/RequestBatching.d.ts",
+      "import": "./dist/RequestBatching.js"
     },
     "./Sql": {
-      "types": "./dist/Sql.d.mts",
-      "import": "./dist/Sql.mjs"
+      "types": "./dist/Sql.d.ts",
+      "import": "./dist/Sql.js"
     },
     "./Telemetry": {
-      "types": "./dist/Telemetry.d.mts",
-      "import": "./dist/Telemetry.mjs"
+      "types": "./dist/Telemetry.d.ts",
+      "import": "./dist/Telemetry.js"
     }
   },
   "scripts": {
-    "build": "tsdown --config-loader native",
+    "build": "tsdown --config-loader native && tsc -p tsconfig.build.json",
     "typecheck": "tsc --noEmit",
     "test": "vitest run",
     "test:watch": "vitest",
-    "pack:check": "npm run build && npm pack --dry-run"
+    "pack:check": "npm run build && node scripts/check-package.mjs",
+    "docs:generate": "node scripts/generate-api.mjs",
+    "docs:check": "tsc -p tsconfig.docs.json && node scripts/generate-api.mjs --check && node scripts/check-links.mjs",
+    "check": "npm run typecheck && npm test && npm run build && npm run docs:check",
+    "examples:install": "npm ci --prefix examples/todoapp && npm ci --prefix examples/blogapp",
+    "examples:check": "npm run typecheck --prefix examples/todoapp && npm test --prefix examples/todoapp && npm run typecheck --prefix examples/blogapp && npm test --prefix examples/blogapp && npm run build --prefix examples/blogapp",
+    "prepack": "npm run build && npm run docs:check"
   },
   "peerDependencies": {
-    "effect": ">=4.0.0-rc.112 <5"
+    "effect": "~4.0.6"
   },
   "devDependencies": {
-    "@effect/platform-node": "^4.0.0-rc.112",
-    "@types/node": "^24.0.0",
+    "@effect/platform-node": "4.0.6",
+    "@types/node": "26.6.5",
     "capnweb": "0.12.0",
-    "effect": "4.0.0-rc.112",
-    "jose": "^6.2.10",
-    "tsdown": "^0.22.0",
-    "typescript": "^5.9.3",
-    "vitest": "^3.2.7"
+    "effect": "4.0.6",
+    "jose": "6.2.13",
+    "tsdown": "0.23.2",
+    "typescript": "7.0.2",
+    "vitest": "5.0.5",
+    "vite": "8.3.5",
+    "tsx": "4.23.15"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/swarthout/effect-rpc-pipeline.git"
+  },
+  "homepage": "https://github.com/swarthout/effect-rpc-pipeline#readme",
+  "bugs": {
+    "url": "https://github.com/swarthout/effect-rpc-pipeline/issues"
+  },
+  "engines": {
+    "node": "^24.11.0 || >=26.0.0"
+  },
+  "keywords": [
+    "effect",
+    "rpc",
+    "pipelining",
+    "batching",
+    "typescript"
+  ],
+  "publishConfig": {
+    "access": "public"
   }
 }
