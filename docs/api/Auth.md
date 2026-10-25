@@ -1,10 +1,23 @@
 # Auth
 
-Extract redacted bearer credentials, provide native server/client middleware, and assert authentication coverage. The application owns token verification and authorization. BearerOptions.maxLength defaults to 8192 characters including the scheme.
+Connect bearer credentials to native Effect RPC middleware. Your application verifies tokens and decides what the caller may do.
+
+## Common tasks
+
+| Task | API |
+| --- | --- |
+| Extract a redacted bearer credential | `bearerToken` |
+| Supply a principal from your token verifier | `layerBearer` |
+| Read the current credential for each client execution | `layerClientBearer` |
+| Check that each RPC is explicitly public or protected | `assertCoverage` |
+
+`BearerOptions.maxLength` defaults to 8,192 characters, including the scheme.
 
 Import from `effect-rpc-pipeline/Auth`. See the [API overview](../api.md) and [contracts and limits](../guides/contracts.md).
 
-These signatures are generated from the published declarations. Relative imports in the signatures refer to other package declarations. Update with `npm run docs:generate`.
+## Complete signatures
+
+These signatures come from the package declarations. Relative imports refer to other package modules.
 
 ```ts
 import * as Context from "effect/Context";

@@ -1,10 +1,18 @@
 # Duplex
 
-Low-level bidirectional session protocol used by the WebSocket helpers. Most applications do not need this module. Rpcs and individual protocol RPCs, Server and ClientSession, handlers, and value transforms support custom persistent transports.
+Implement the bidirectional session protocol used by the WebSocket helpers. Most applications can use PipelineClient and PipelineServer without importing this module.
+
+## Adapter APIs
+
+- `Rpcs` and the individual protocol RPCs define the session messages.
+- `Server` and `ClientSession` manage the two sides of a session.
+- Handlers and value transforms connect capabilities to a persistent transport.
 
 Import from `effect-rpc-pipeline/Duplex`. See the [API overview](../api.md) and [contracts and limits](../guides/contracts.md).
 
-These signatures are generated from the published declarations. Relative imports in the signatures refer to other package declarations. Update with `npm run docs:generate`.
+## Complete signatures
+
+These signatures come from the package declarations. Relative imports refer to other package modules.
 
 ```ts
 import * as Cause from "effect/Cause";

@@ -1,18 +1,33 @@
 # effect-rpc-pipeline
 
-Promise pipelining, batching, and bidirectional capabilities for Effect RPC.
+Compose typed Effect RPC calls into one request.
 
-Compose dependent remote calls into one request. The server runs their dependency graph, applies normal Effect RPC middleware, and returns the data you select. Building a call performs no I/O; running it as an Effect sends the graph.
+Pass the result of one RPC to another without waiting for it to travel back to the client. The server resolves the dependencies and returns the data you select.
+
+You define the RPCs with Effect. This library adds a way to compose them on the client.
+
+Start with [installation](#install) and the [quickstart](#quickstart), or read [how execution works](#how-execution-works). The rest of this README introduces authentication, streams, capabilities, batching, and transactions.
+
+The [usage guide](docs/guides/usage.md) has detailed integrations. The [API reference](docs/api.md) lists every public type and function.
 
 ## Why pipeline RPC?
 
-A screen often needs a user, then that user's profile, friends, or permissions. Ordinary sequential RPC calls wait for each result to travel back to the client before the next call can start. Moving the workflow into one server endpoint avoids those round trips, but creates a new endpoint for each response shape.
+Suppose a screen needs a user and that user’s profile. With sequential RPC calls, the client fetches the user, waits for the response, and then sends the user ID in a second request.
 
-A pipeline lets the client describe those dependencies and its desired response. The server runs the operations through your existing Effect RPC handlers and middleware. You keep control of the exposed operations, schemas, authorization, and execution limits; the client chooses how to compose them.
+A pipeline sends both operations together. On the server, the profile lookup waits for the user lookup. The result comes back in one response.
 
-Use it for dependent reads, independent query batches, mutation-plus-refresh responses, or narrow capability APIs. Batching network calls does not automatically batch database queries or provide a transaction. The integrations below address those separate concerns.
+The client describes the work using the RPCs you expose. Your handlers, schemas, and authentication middleware still control what each operation can do.
 
-Version **0.1.0** targets **Effect 4.0.6**, **Node.js 24.11+ (24.x) or 26+**, and modern browsers. This is an ESM package. Effect's RPC, HTTP, socket and SQL modules remain unstable APIs; the tested peer range is `~4.0.6`. See [compatibility and contracts](docs/guides/contracts.md).
+Use pipelines to:
+
+- Fetch related data with fewer network round trips.
+- Run independent queries in one request.
+- Return refreshed data after a mutation.
+- Call a restricted set of methods through a typed capability.
+
+A single network request can still produce many database queries. [Backend batching](docs/guides/usage.md#backend-request-batching-and-caching) combines those reads; [transactions](docs/guides/usage.md#transactions) make database changes atomic.
+
+**Requirements:** version 0.1.0 uses Effect 4.0.6 and ESM. Servers need Node.js 24.11+ in the 24.x line, or Node.js 26+. Clients also run in modern browsers. See [compatibility](docs/guides/contracts.md#compatibility) for the tested environment.
 
 ## Install
 
@@ -30,9 +45,11 @@ npm pkg set type=module
 
 ## Quickstart
 
-Create three files. The same RPC group defines the server and client contract.
+This example finds a user, then fetches their profile in the same pipeline. Create the following three files in one directory.
 
-`rpcs.ts`:
+### 1. Define the RPC contract
+
+Create `rpcs.ts`. Both the server and client import this group.
 
 <!-- snippet:rpcs:start -->
 ```ts
@@ -53,7 +70,9 @@ export const AppRpcs = RpcGroup.make(
 ```
 <!-- snippet:rpcs:end -->
 
-`server.ts`:
+### 2. Implement and serve the RPCs
+
+Create `server.ts`. The handlers below return sample data; an application would read from its own services.
 
 <!-- snippet:server:start -->
 ```ts
@@ -84,7 +103,9 @@ Layer.launch(Server).pipe(NodeRuntime.runMain)
 ```
 <!-- snippet:server:end -->
 
-`client.ts`:
+### 3. Compose the client calls
+
+Create `client.ts`. `user.id` is a reference to the server’s future result, so it can be passed directly to `getProfile`.
 
 <!-- snippet:client:start -->
 ```ts
@@ -109,6 +130,8 @@ console.log(await Effect.runPromise(program))
 ```
 <!-- snippet:client:end -->
 
+### 4. Run the example
+
 Start the server, then run the client in a second terminal:
 
 ```sh
@@ -116,32 +139,50 @@ node --import tsx server.ts
 node --import tsx client.ts
 ```
 
-The result is `{ user: { id: "ada", name: "Ada" }, profile: { bio: "Profile for ada" } }`. `getProfile` uses the result of `findUser`; both run through one HTTP pipeline request.
+The client prints:
 
-These [quickstart files](docs/snippets) are compiled by `npm run docs:check`. When running them from this repository, build the package first and use `node --import tsx docs/snippets/server.ts` and `node --import tsx docs/snippets/client.ts`.
+```text
+{ user: { id: "ada", name: "Ada" }, profile: { bio: "Profile for ada" } }
+```
+
+The server ran `findUser` first, then passed its ID to `getProfile`. Both calls traveled in one HTTP pipeline request.
+
+The [quickstart source files](docs/snippets) are checked by TypeScript. To run them from this repository, build the package first, then use `node --import tsx docs/snippets/server.ts` and `node --import tsx docs/snippets/client.ts`.
 
 ## How execution works
 
-A finite RPC call returns a `Pipeline.Remote<A, E, R>`. It is a symbolic reference to a future server result and an ordinary `Effect` that produces that result. Its types carry the selected success data, errors, and Effect service requirements.
+An RPC that returns one result gives you a `Pipeline.Remote<A, E, R>`. This **remote value** describes a future result. It is also an Effect: running it executes the graph and produces that result.
+
+Its type carries the success value (`A`), possible errors (`E`), and required services (`R`).
 
 1. Calling `rpc.findUser(...)` builds a graph node without sending anything.
 2. Reading `user.id` builds a field reference. Passing it to another RPC establishes a dependency.
 3. `Pipeline.all` selects the data to return and combines the referenced operations into one graph.
 4. Running the final remote sends that graph. The server validates it, schedules ready operations, and returns the selected data.
 
-In the quickstart, `findUser` runs first. `getProfile` receives its resulting ID on the server; there is no intermediate trip back to the client. Independent operations can run concurrently, subject to the server's global concurrency limit.
+In the quickstart, `getProfile` depends on `findUser`. Independent calls can run concurrently, up to the server’s concurrency limit.
 
-A remote is lazy and repeatable. Yielding the same remote twice executes its graph twice, including mutations. Reusing that remote in several places in one `Pipeline.all` shares the same node. Two separately constructed calls remain distinct operations, even if their payloads match. Values from different client instances cannot be combined into one graph.
+### Reuse and repeat execution
 
-`Effect.all` runs several Effects normally and can therefore send several requests. Use `Pipeline.all` when you want one pipeline request.
+A remote value is lazy. Building or reusing it does not send a request.
+
+- Include the same remote several times in one `Pipeline.all` to share one graph node.
+- Construct two separate calls to get two separate operations, even if their payloads match.
+- Run the same remote twice to execute its graph twice, including any mutations.
+
+All values in a graph must come from the same client instance.
+
+### Choose the batching operator
+
+Use `Pipeline.all` to combine calls into one pipeline request. `Effect.all` runs the remote Effects separately and can send several requests.
 
 ## Compose calls and select results
 
-These examples run inside `Effect.gen`, using a client whose RPC group includes the methods shown. The additional contracts and complete example functions live in [overview.ts](docs/snippets/overview.ts) and are checked by TypeScript along with the quickstart.
+The following examples run inside `Effect.gen` with an `rpc` client that exposes the methods shown. Their full contracts are in the checked [example source](docs/snippets/overview.ts).
 
 ### Select several results
 
-A selection can contain objects, arrays, nested structures, literals, and remote values. Only the selected structure is returned; intermediate values can stay on the server.
+Use `Pipeline.all` to describe the result you want back. You can select remote values, individual fields, literals, arrays, and nested objects. Intermediate results can stay on the server.
 
 <!-- snippet:selection:start -->
 ```ts
@@ -155,7 +196,7 @@ const account = yield* Pipeline.all({
 ```
 <!-- snippet:selection:end -->
 
-Both `getProfile` and `listFriendIds` depend on the user lookup, but not on each other. Once the lookup completes, they can run concurrently in the same request. Their typed errors and requirements are included in the resulting Effect.
+Here both lookups need `user.id`. Once `findUser` finishes, they can run concurrently. The resulting Effect includes their errors and service requirements.
 
 ### Map arrays and Options
 
@@ -173,9 +214,11 @@ const friends = yield* Pipeline.map(
 ```
 <!-- snippet:map:end -->
 
-The mapper describes a template; the server runs that template for each item. Dependent calls inside a template and nested maps are supported. A nested mapper can reference an outer item. Calls constructed inside the callback run per item; construct a call outside the callback when its result should be shared.
+The callback describes work for the server to repeat for each item. A call built inside the callback runs once per item. Build a call outside the callback when its result should be shared.
 
-The same operator maps Effect `Option` values. If `findUserByHandle` returns `None`, `getProfile` is skipped and the result remains `None`. For `Some(user)`, the result is `Some(profile)`:
+Maps can be nested, and an inner map can refer to an outer item.
+
+The same operator handles Effect `Option` values. For `Some(user)`, the server runs the mapped calls and returns `Some(profile)`. For `None`, it skips those calls and returns `None`.
 
 <!-- snippet:option:start -->
 ```ts
@@ -186,11 +229,15 @@ const profile = yield* Pipeline.map(
 ```
 <!-- snippet:option:end -->
 
-Map and sequencing callbacks run locally while the graph is being built. Their parameters are symbolic: you can project them, pass them to RPCs, map them, or select them. Ordinary JavaScript branching, arithmetic, and string interpolation cannot inspect remote data. Put a data-dependent decision in an RPC handler instead.
+### Work with symbolic values
+
+Map and sequencing callbacks run on the client while the graph is being built. Their inputs describe server results; they do not contain those results yet.
+
+You can project a field, pass it to another RPC, select it, or map it. To branch, calculate, or format a string based on remote data, put that work in an RPC handler.
 
 ### Read after a mutation
 
-`Pipeline.andThen` starts a new execution phase. All calls introduced by its callback wait for the preceding phase, including calls without a direct data dependency on the mutation:
+`Pipeline.andThen` makes later calls wait for the earlier work to finish. Use it to read updated data after a mutation, including reads that do not directly use the mutation’s result:
 
 <!-- snippet:phase:start -->
 ```ts
@@ -204,13 +251,13 @@ const refreshed = yield* rpc.renameUser({ userId, name }).pipe(
 ```
 <!-- snippet:phase:end -->
 
-The client chooses the response shape after `renameUser`. The profile and friend list run after the rename and can run concurrently with each other. All of this is still one pipeline request.
+After the rename finishes, the server fetches the profile and friend IDs concurrently. The client receives its chosen response shape in the same pipeline request.
 
-`Pipeline.zipRight(first, second)` is the shorter form when you only want the second result. Sequencing provides ordering; use the SQL integration when the mutation and follow-up reads must belong to one transaction.
+Use `Pipeline.zipRight(first, second)` when you only need the second result. For database isolation as well as ordering, add a [SQL transaction](docs/guides/usage.md#transactions).
 
 ## Use clients as Effect services
 
-`makeHttp` is convenient for scripts and small programs. In an application, define a service from the same RPC group and provide its implementation as a Layer:
+Use `makeHttp` directly in scripts. In an application, define a client service and provide its implementation as an Effect Layer:
 
 <!-- snippet:client-service:start -->
 ```ts
@@ -241,11 +288,15 @@ There are matching constructors and Layers for different boundaries:
 | Same process | `makeInProcess` | `layerClientInProcess` | Finite graphs through the server without network I/O |
 | Custom transport | `make` | Application-owned Layer | Defined by the supplied transport or Effect protocol |
 
-An in-process client is useful for tests, server-side tools, and SSR. It runs the normal graph validation, handlers, middleware, batching, and transaction integrations. It does not provide native streams or connection-scoped handles. The [blog example](examples/blogapp) uses it to load page data before rendering HTML.
+Use an in-process client for tests, server tools, or server-side rendering (SSR). It runs graph validation, middleware, handlers, batching, and transactions without network I/O.
+
+Streams and persistent capability handles need WebSocket. The [blog example](examples/blogapp) uses an in-process client to load its SSR pages.
 
 ## Authentication and authorization
 
-Server authentication remains native Effect RPC middleware. Apply it to the RPCs that need protection; pipeline execution invokes that middleware for each protected operation and supplies its principal service to the handler. Domain handlers still enforce ownership, roles, scopes, and other resource rules.
+Protect RPCs with native Effect RPC middleware. Pipeline execution runs that middleware for each protected operation and supplies the authenticated principal to the handler.
+
+Handlers enforce resource permissions, such as whether the caller owns the record being changed.
 
 Use normal Effect RPC headers to authenticate a complete pipeline:
 
@@ -259,20 +310,26 @@ const account = yield* Pipeline.all({
 ```
 <!-- snippet:headers:end -->
 
-The optional `Auth` module provides:
+The optional `Auth` helpers reduce the wiring:
 
-- `bearerToken` for strict extraction into an Effect `Redacted` value;
-- `layerBearer` for connecting an application-owned verifier to a principal service;
-- `layerClientBearer` for reading the current credential on every execution, including mixed public/protected groups; and
-- `assertCoverage` for checking that each RPC is explicitly public or protected by the expected middleware.
+- `bearerToken` extracts the credential as an Effect `Redacted` value.
+- `layerBearer` connects your token verifier to a principal service.
+- `layerClientBearer` reads the current credential on each execution.
+- `assertCoverage` checks that every RPC is explicitly public or protected.
 
-The package does not issue tokens or verify JWT signatures. Your verifier owns algorithm, issuer, audience, lifetime and claim checks. Send bearer credentials in the Authorization header over TLS. Client middleware propagates credentials; server middleware and domain authorization enforce access.
+Your application issues and verifies tokens. For JWTs, the verifier checks the signature, allowed algorithm, issuer, audience, lifetime, and claims. Send bearer credentials in the Authorization header over TLS.
 
-Client middleware shared by several graph nodes runs once around the batch, with a synthetic request containing the graph. Header propagation is supported; per-RPC payload rewriting or short-circuiting with a domain result is not. See the [authentication guide](docs/guides/usage.md#authentication-and-authorization) for complete service and Layer wiring and the [todo example](examples/todoapp) for JWT verification and ownership checks.
+Client middleware adds headers once around the whole pipeline. It cannot rewrite each RPC payload or replace the batch with a domain result.
+
+See the [authentication guide](docs/guides/usage.md#authentication-and-authorization) for the service wiring, and the [todo example](examples/todoapp) for token verification and ownership checks.
 
 ## WebSockets and streams
 
-HTTP and WebSocket routes can share `/rpc`: POST serves finite HTTP pipelines, while GET upgrades establish persistent connections. Provide the handlers and serialization Layer to these routes as in the quickstart:
+Use WebSocket when you need streams or capability handles that survive beyond one request. HTTP and WebSocket routes can share `/rpc`: POST serves HTTP pipelines, and GET upgrades open WebSocket connections.
+
+### Serve both transports
+
+Provide the handlers and serialization Layer to these routes as in the quickstart:
 
 <!-- snippet:websocket-routes:start -->
 ```ts
@@ -283,7 +340,9 @@ const Routes = Layer.merge(
 ```
 <!-- snippet:websocket-routes:end -->
 
-Finite methods still return remote Effects over WebSocket. RPCs declared with `stream: true` return native Effect Streams. For example, a `watchUsers` RPC returning a stream of users can be consumed with:
+### Consume a stream
+
+Ordinary methods still return remote Effects over WebSocket. Methods declared with `stream: true` return native Effect Streams. Here `watchUsers` publishes a stream of users:
 
 <!-- snippet:websocket:start -->
 ```ts
@@ -304,13 +363,19 @@ const watchUsers = Effect.scoped(Effect.gen(function*() {
 
 The connection stays open while the scope is active. `layerClientWebSocket` makes the service Layer the owner when an application needs one shared connection. Calls, streams, and capabilities use that same connection.
 
-Streams have their own lifetime and backpressure. They cannot be selected into finite `Pipeline.all`, `Pipeline.map`, or `Pipeline.andThen` graphs; compose them with Effect's Stream operators. The [WebSocket guide](docs/guides/usage.md#websockets-and-streams) covers protocol Layers and transport configuration.
+Consume streams with Effect’s Stream operators. They have their own lifetime and backpressure, so they cannot be selected into a finite `Pipeline.all`, `map`, or `andThen` graph.
+
+See the [WebSocket guide](docs/guides/usage.md#websockets-and-streams) for transport configuration.
 
 ## Typed capabilities and callbacks
 
-A capability is an RPC surface bound to a server-side object or context. Instead of repeatedly passing a user or resource ID, a handler can validate access once and return a narrow set of operations for that context. No JavaScript function or closure is serialized.
+A **capability** gives its receiver a typed set of methods tied to one implementation. For example, an authenticated session can expose `currentUser()` without asking the client to send a user ID each time.
 
-Here `User` is the `{ id, name }` schema used by the examples. Define the surface with an ordinary `RpcGroup`, then use its capability schema as an RPC result:
+Only an opaque handle crosses the connection. JavaScript functions and closures stay where they were created.
+
+### Define a capability
+
+Use an ordinary `RpcGroup` to define its methods. The capability’s schema can then be used as an RPC result. Here `User` has the `{ id, name }` fields used above:
 
 <!-- snippet:capability-definition:start -->
 ```ts
@@ -324,7 +389,9 @@ const OpenSession = Rpc.make("openSession", { success: UserSession.schema })
 ```
 <!-- snippet:capability-definition:end -->
 
-An authenticated `openSession` handler can construct the implementation from its principal service. In this example `CurrentUser` is supplied by server authentication middleware:
+### Implement its methods
+
+The `openSession` handler reads `CurrentUser`, supplied by authentication middleware, and creates the session’s implementation:
 
 <!-- snippet:capability-handler:start -->
 ```ts
@@ -340,7 +407,9 @@ const openSession = Effect.gen(function*() {
 ```
 <!-- snippet:capability-handler:end -->
 
-Use `openSession` as the handler for `OpenSession` in the authenticated RPC group. A client can call through the symbolic capability inside one pipeline:
+### Call it within a pipeline
+
+Use `openSession` as the handler for `OpenSession` in a protected RPC group. The client can then create a session and call its methods in one pipeline:
 
 <!-- snippet:capability-pipeline:start -->
 ```ts
@@ -354,7 +423,9 @@ const account = yield* Pipeline.all({
 
 The server creates the session and invokes its methods, returning only the selected account data. This works over HTTP because the capability is used entirely within the graph that creates it.
 
-Over WebSocket, the capability can also be returned to the client and used in later requests:
+### Keep a handle over WebSocket
+
+A WebSocket client can retain the handle for later requests:
 
 <!-- snippet:capability-persistent:start -->
 ```ts
@@ -365,11 +436,15 @@ yield* Capability.release(session)
 ```
 <!-- snippet:capability-persistent:end -->
 
-Persistent handles are bound to their session and connection. Releasing a handle or closing its connection makes it unavailable; reacquire handles after reconnect. Capability definitions have unique IDs within a module registry.
+Release a remote handle when you no longer need it. Closing the connection also makes its handles unavailable. After reconnecting, request new handles. Each capability definition needs a unique ID in the module registry.
 
-Capabilities capture application services and principals, while library request caches and transaction state remain local to each execution. Capturing a principal does not implement automatic revocation. Recheck changing ownership, suspension, or role policy in capability handlers when required. The blog's author handles demonstrate those checks.
+A capability retains the application services and principal present at creation. It does not retain library request caches or transaction state.
 
-WebSocket clients can export capabilities too. For example, an RPC accepting a `NotificationSink` capability can later call the client's typed `notify` method:
+If permissions can change, check them again in the capability’s handlers. Capturing a principal does not automatically revoke a handle when a role changes or an account is suspended. The blog example shows these checks.
+
+### Let the server call the client
+
+WebSocket clients can also implement capabilities. For example, the client can pass a `NotificationSink` whose `notify({ message })` method returns a boolean:
 
 <!-- snippet:callback:start -->
 ```ts
@@ -381,13 +456,17 @@ yield* rpc.registerNotifications({ sink })
 ```
 <!-- snippet:callback:end -->
 
-Here `NotificationSink` is defined with a `notify({ message })` RPC returning a boolean, and `registerNotifications` accepts its capability schema. Keep the client scope open for as long as the callback is needed. The [capability guide](docs/guides/usage.md#typed-capabilities) includes full contracts, server invocation, cancellation, and connection ownership examples.
+`registerNotifications` accepts the capability schema. Keep the WebSocket scope open while callbacks are needed.
+
+The [capability guide](docs/guides/usage.md#typed-capabilities) covers full contracts, cancellation, and connection ownership.
 
 ## Batch backend work and cache reads
 
-One network request can still cause many database queries. `RequestBatching` integrates native Effect Requests, RequestResolvers, and Cache so concurrent lookups can be deduplicated and sent to a real bulk loader.
+One pipeline request can still cause many database queries. `RequestBatching` uses Effect’s RequestResolver and Cache APIs to collect concurrent reads and send them to a bulk loader.
 
-This example's application-owned `Users` service implements `findMany(ids)` with one bulk database operation:
+### Write a bulk resolver
+
+The `Users` service in this example implements `findMany(ids)` with a bulk database operation:
 
 <!-- snippet:batching:start -->
 ```ts
@@ -419,15 +498,25 @@ const getUser = (id: string) => Effect.flatMap(
 ```
 <!-- snippet:batching:end -->
 
-Use `getUser` in handlers and provide the `Users` service normally. Pipeline execution supplies one `RequestScope` around the graph. For an RPC group that also needs request caching outside pipelines, apply `RequestBatching.Middleware` and provide `RequestBatching.layer`.
+### Use the cache in handlers
 
-Create each cache descriptor once in a service or module. Constructing it inside the lookup creates a different cache on each call. Partition caches by the actual principal or tenant when one pipeline can use several authorization contexts, and invalidate affected entries after mutations.
+Call `getUser` from your handlers and provide the `Users` service normally. Pipeline execution supplies one `RequestScope` around the graph.
 
-The resolver must perform a real bulk query; looping over single-row queries inside `runAll` still produces N+1 work. Resolver batch size also depends on concurrency windows, so a large map may use several bulk queries while still sharing one network request. See the [batching guide](docs/guides/usage.md#backend-request-batching-and-caching) and the blog's SQL query-count tests.
+For standalone RPCs that also need this cache, apply `RequestBatching.Middleware` and provide `RequestBatching.layer`.
+
+Create the cache descriptor once in a service or module. Creating it inside each lookup gives every call a different cache.
+
+When one graph can use several tenants or principals, partition the cache by that identity. Mutations should invalidate affected entries before later reads.
+
+The resolver must perform a bulk query. A loop of single-row queries still does N+1 database work.
+
+Concurrency limits can divide a large map into several resolver batches. One pipeline request therefore does not guarantee one database query. See the [batching guide](docs/guides/usage.md#backend-request-batching-and-caching) for details.
 
 ## Transactions, after-commit work, and telemetry
 
-Server integrations use the `middleware` array. For example, combine native Effect tracing/metrics with one SQL transaction around each validated finite pipeline:
+### Run a graph in a transaction
+
+Server integrations go in the `middleware` array. This example adds Effect telemetry and a SQL transaction around each valid finite graph:
 
 <!-- snippet:middleware:start -->
 ```ts
@@ -442,11 +531,21 @@ const TransactionalRoutes = PipelineServer.layerHttp({
 ```
 <!-- snippet:middleware:end -->
 
-Provide your handler Layer and an Effect SQL driver Layer when serving these routes. Successful graphs commit; typed failures, defects, and interruption roll back. Invalid graphs are rejected before a transaction starts. `transaction({ when })` can select which graphs use a transaction.
+Provide your handler Layer and an Effect SQL driver Layer when serving the routes.
 
-The boundary is the finite graph. Native streams and direct calls on an already exported capability do not automatically enter pipeline execution middleware. Put a transaction inside a domain handler when those entry points also need it. Reverse peer calls are rejected while a pipeline transaction is active so database locks are not held waiting for a client response.
+- Successful graphs commit.
+- Typed failures, defects, and interruption roll back.
+- Invalid graphs are rejected before a transaction starts.
 
-Inside a transactional handler, register best-effort work that should run only after commit:
+Use `transaction({ when })` to choose which graphs need a transaction.
+
+This middleware wraps finite graphs. Streams and direct calls on an exported capability need transaction policy in their own handlers.
+
+A pipeline transaction rejects calls to a remote peer, so it cannot hold database locks while waiting for a client response.
+
+### Run work after commit
+
+Use `afterCommit` inside a transactional handler for follow-up work such as a notification:
 
 <!-- snippet:after-commit:start -->
 ```ts
@@ -456,15 +555,27 @@ yield* PipelineSql.afterCommit(
 ```
 <!-- snippet:after-commit:end -->
 
-Deferred effects run sequentially after commit and are discarded on rollback. Pass immutable invocation data into them; they run with the outer execution services after the transaction connection has been released. Failures are reported without undoing the committed mutation. Durable delivery requires an outbox or another persistent mechanism. Calling `afterCommit` outside an active transaction region is a defect.
+The effects run sequentially after commit and are discarded on rollback. Their failures are reported without undoing the committed mutation.
 
-Transaction infrastructure failures have `retryable: false`: a failed commit may have an unknown outcome. Use application idempotency before retrying a mutation.
+Pass the data they need explicitly. They run with the outer execution services, after the transaction connection has been released.
 
-`Telemetry.make` creates a pipeline span, child invocation spans, and metrics for counts, duration, graph size, and outcomes. It uses Effect's tracer and metric registry, so an existing Effect OpenTelemetry Layer can export them. Tracing and metrics can be configured independently; payloads and credentials are not added as attributes. See the [transaction](docs/guides/usage.md#transactions), [after-commit](docs/guides/usage.md#run-effects-after-a-successful-commit), and [telemetry](docs/guides/usage.md#tracing-and-metrics) guides for configuration.
+Use an outbox when delivery must survive a process crash. Calling `afterCommit` outside an active transaction region is a defect.
+
+A transaction infrastructure error has `retryable: false` because a failed commit may have an unknown outcome. Make mutations idempotent before adding automatic retries.
+
+### Trace and measure execution
+
+`Telemetry.make` creates a span for the graph, child spans for invoked RPCs, and metrics for counts, duration, graph size, and outcomes.
+
+It uses Effect’s tracer and metric registry, so an existing OpenTelemetry Layer can export the data. Tracing and metrics can be configured separately. Payloads and credentials are excluded.
+
+See the [transaction](docs/guides/usage.md#transactions), [after-commit](docs/guides/usage.md#run-effects-after-a-successful-commit), and [telemetry](docs/guides/usage.md#tracing-and-metrics) guides for setup.
 
 ## Errors and supported values
 
-Declared RPC errors stay in the Effect error channel, and composition accumulates errors from dependent calls. Handle a domain failure with normal Effect operators:
+### Handle errors by tag
+
+Use normal Effect operators to handle declared RPC errors. A composed pipeline includes the errors from its dependent calls:
 
 <!-- snippet:errors:start -->
 ```ts
@@ -474,19 +585,39 @@ const maybeUser = rpc.findUser({ email }).pipe(
 ```
 <!-- snippet:errors:end -->
 
-This handles `UserNotFound`; transport and pipeline infrastructure failures remain possible. `PipelineProtocolError` reports malformed graphs, invalid references or paths, unsupported operations and exceeded limits. `PipelineExecutionError` represents safe infrastructure failures, while native transport failures use `RpcClientError`. Defects remain Effect defects. Cancellation propagates into executing work and active callbacks.
+This handles `UserNotFound`. Other failures remain possible:
 
-Graph validation happens before handlers start, but payload and capability-method validation can depend on earlier results. A runtime failure can occur after an earlier mutation has completed. Use a transaction when rollback is required; there is no automatic retry or exactly-once guarantee.
+| Error | Meaning |
+| --- | --- |
+| `PipelineProtocolError` | Invalid graph, reference, path, operation, value, or exceeded limit |
+| `PipelineExecutionError` | A safe server infrastructure failure |
+| `RpcClientError` | A transport failure |
 
-Finite pipeline values are JSON data, undefined, and Effect Options. Result and error classes cross the aggregate boundary as data fields, without prototypes, custom methods, or `instanceof` behavior. `Pipeline.Data<A>` describes finite success data. Use tagged error matching rather than `instanceof` on remote domain errors.
+Unexpected defects remain Effect defects. Cancellation propagates to executing work and active callbacks.
 
-Dates, maps, sets, binary buffers and other non-data values need explicit transfer schemas or native RPC outside the finite graph. Arbitrary client-side schema transformations are not applied to symbolic expressions. Unsupported literals and cyclic inputs fail during construction; unsupported or oversized final results fail instead of being silently coerced.
+The server validates the graph before starting handlers. Some payload and capability checks need earlier results, so they happen later. A failure can occur after a mutation has completed.
 
-For fields that collide with JavaScript or Effect properties, use `Pipeline.field(remote, "then")` or `Pipeline.field(remote, "graph")`. Normal data fields such as `name` and `length` project directly. Root RPC tags `then` and `__effect_rpc_pipeline_*`, and capability methods that shadow handle metadata or `release`/`invoke`, are reserved. The [contracts guide](docs/guides/contracts.md) specifies reserved names, wire markers, schema boundaries, and adapter obligations.
+Use a transaction when rollback is required. The library does not automatically retry a graph or guarantee exactly-once execution.
+
+### Return plain data
+
+Finite pipelines return JSON data, `undefined`, and Effect Options. A schema class returns its fields, without its prototype or methods. `Pipeline.Data<A>` describes that result.
+
+Use error tags rather than `instanceof` for remote domain errors.
+
+Represent Dates, maps, sets, and binary buffers with explicit data transfer schemas, or use native RPC outside a finite graph. Symbolic graph expressions do not run arbitrary client-side schema transformations.
+
+Unsupported or cyclic inputs fail during construction. Unsupported or oversized final results fail instead of being silently coerced.
+
+For reserved fields, use `Pipeline.field(remote, "then")` or `Pipeline.field(remote, "graph")`. Fields such as `name` and `length` project directly.
+
+The [contracts guide](docs/guides/contracts.md) lists reserved RPC and capability names, wire markers, and schema boundaries.
 
 ## Execution limits and compatibility
 
-The server limits submitted graphs and active work:
+### Bound the work a graph can request
+
+The server applies these default budgets:
 
 | Option | Default | Scope |
 | --- | --- | --- |
@@ -498,11 +629,19 @@ The server limits submitted graphs and active work:
 | `maxExpressionNodes` | 100,000 | Visited request structure values, including literals |
 | `maxExecutionSteps` | 100,000 | Total node, map-item, expression, and projection-path steps |
 
-Set these under `limits` on `PipelineServer.layerHttp`, `layerWebSocket`, or `handle`. Each duplex session also caps server handles, pending reverse calls, and queued callback events at 1,000. Input construction and final results have additional structure guards described in the [contracts guide](docs/guides/contracts.md#limits-and-deployment).
+Set these under `limits` on `PipelineServer.layerHttp`, `layerWebSocket`, or `handle`. Duplex sessions also cap server handles, pending reverse calls, and queued callback events at 1,000 each.
 
-The execution-step budget bounds template expansion even when nested maps do not invoke additional RPCs. It counts structural work, not handler CPU time or database cost. Limits are resource controls, not an all-or-nothing execution promise. A map's size or dynamic cost may only be known after earlier operations have run. Applications still own HTTP body limits, timeouts, connection quotas, rate limits, TLS and trusted proxy configuration.
+See [contracts and limits](docs/guides/contracts.md#limits-and-deployment) for the fixed input/output guards and the complete budget rules.
 
-Use matching Effect ecosystem versions. The tested baseline is **4.0.6**, with a `~4.0.6` peer range, because RPC, HTTP, sockets and SQL remain annotated unstable despite their stable package version and shorter import paths. Deploy clients and servers from matching library versions. Supported Node versions are **24.11+ in the 24.x line and 26+**; browser clients need ES2022, fetch, WebSocket and Web Crypto in an appropriate secure context. ESM is the supported module format.
+`maxExecutionSteps` bounds structural work, including nested maps that make no RPC calls. It does not measure CPU time in handlers or database cost.
+
+A limit can be reached after earlier operations have run. It does not undo completed mutations. Configure body limits, timeouts, connection quotas, rate limits, TLS, and trusted proxies at your application boundary.
+
+### Keep client and server versions aligned
+
+Use matching Effect, platform, and SQL versions. The tested baseline is 4.0.6, with a `~4.0.6` peer range. Effect’s RPC, HTTP, socket, and SQL APIs still carry unstable annotations.
+
+Deploy clients and servers from matching library versions. See [compatibility](docs/guides/contracts.md#compatibility) for Node, browser, and ESM requirements.
 
 ## Modules, guides, and complete examples
 
@@ -520,7 +659,9 @@ Import individual modules as `effect-rpc-pipeline/Pipeline`, `effect-rpc-pipelin
 | `Telemetry` | Effect tracing and metrics middleware |
 | `Duplex` | Low-level bidirectional protocol for transport adapters |
 
-The [API reference](docs/api.md) contains every public signature and option. The [usage guide](docs/guides/usage.md) expands the patterns above into detailed integrations; [contracts and limits](docs/guides/contracts.md) defines precise operational behavior. Existing RC users should read the [migration guide](docs/guides/migration.md).
+For full signatures, use the [API reference](docs/api.md). For detailed integrations, use the [usage guide](docs/guides/usage.md). The [contracts page](docs/guides/contracts.md) defines the precise runtime behavior.
+
+Upgrading from the earlier RC implementation? Follow the [migration guide](docs/guides/migration.md).
 
 For runnable applications, start with:
 

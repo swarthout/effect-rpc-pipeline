@@ -1,15 +1,65 @@
 # Migrating from the private RC implementation
 
-Upgrade the library, server and clients together. The public target remains 0.1.0; the earlier RC-dependent implementation was not a stable wire contract.
+Upgrade the library, server, and clients together. Version 0.1.0 changes the wire format; clients and servers built from the earlier RC implementation are not compatible with it.
 
-1. Replace Effect `4.0.0-rc.112` and all platform/SQL packages with matching stable `4.0.6` versions. Replace `effect/unstable/rpc/*`, `http/*`, `sql/*`, and `socket/*` paths with `effect/rpc/*`, `effect/http/*`, `effect/sql/*`, and `effect/socket/*`. The upstream modules still carry unstable annotations.
-2. Use Node.js 24.11+ (24.x) or 26+ for the repository toolchain. TypeScript 7 declarations are emitted separately from the JavaScript bundle. Published extensions are now `.js` and `.d.ts`; import public package paths instead of filenames inside `dist`.
-3. Rebuild and reinstall the copied blog dependency after each library change. Foldkit's `evo` helper is now `modifyFields`; the example uses explicit peer overrides for Effect 4.0.6.
-4. Treat finite results as data. Use `Pipeline.Data<A>` when annotating results with a schema class that has methods. Error tags and fields survive, but class prototypes and `instanceof` checks do not. Encode Dates, maps, sets and binary data in explicit transfer schemas.
-5. Use `Pipeline.field` for fields such as `then`, `pipe`, or `graph`. Avoid reserved root RPC tags and capability method names listed in [contracts and limits](contracts.md).
-6. Nested maps now have lexical item scopes, and all calls created inside a map callback execute per item. Move calls outside the callback to share their result. A global concurrency limit can split resolver batches when a map creates several calls per item; size operational limits deliberately.
-7. Transaction infrastructure failures have `retryable: false`. Add idempotency before retrying uncertain mutation outcomes. `afterCommit` work must use outer execution services and cannot rely on captured transaction or invocation-local state.
-8. Reacquire persistent capabilities after reconnect. Capability creation no longer retains library caches or transaction connections. Recheck changing application authorization inside capability handlers.
-9. Configure `BLOG_JWT_SECRET`, `BLOG_PUBLIC_ORIGIN` and the initial `BLOG_ADMIN_PASSWORD` for production. Refresh rotation is atomic, draft events are filtered, and the Vite proxy supports WebSocket upgrades.
+## 1. Update dependencies and imports
 
-Custom transports must support scoped map nodes/item expressions and reserved undefined/Option wire markers. They must preserve the `{ _tag: "Success", value }` or `{ _tag: "Failure", error }` response envelope, propagate headers and interruption, and bind duplex sessions to the actual connection identity. Use `PipelineServer.handle` for graph validation rather than trusting client-supplied dependencies.
+Replace Effect `4.0.0-rc.112` with `4.0.6`. Use the same stable version for the platform and SQL packages.
+
+Update the import paths:
+
+| Old prefix | New prefix |
+| --- | --- |
+| `effect/unstable/rpc/` | `effect/rpc/` |
+| `effect/unstable/http/` | `effect/http/` |
+| `effect/unstable/sql/` | `effect/sql/` |
+| `effect/unstable/socket/` | `effect/socket/` |
+
+These upstream APIs still carry unstable annotations.
+
+Use Node.js 24.11+ in the 24.x line, or Node.js 26+. Import public package paths rather than files inside `dist`. Published extensions are now `.js` and `.d.ts`; declarations are emitted separately from the JavaScript bundle.
+
+## 2. Review finite results
+
+Finite results now contain data fields without class prototypes or methods. Error tags survive, but `instanceof` checks do not. Match errors by tag instead.
+
+Use `Pipeline.Data<A>` when annotating a result whose schema class has methods. Encode Dates, maps, sets, and binary values in explicit data transfer schemas.
+
+For reserved fields, use `Pipeline.field(remote, "then")`, for example. Check the [reserved names](contracts.md#reserved-names) before choosing root RPC tags or capability method names.
+
+## 3. Review maps and concurrency
+
+Nested maps now have lexical item scopes. Every call created inside a map callback runs per item; move it outside the callback when its result should be shared.
+
+A global concurrency limit can split resolver batches, particularly when each item makes several calls. Set limits for the workload you expect.
+
+## 4. Review transaction failures
+
+Transaction infrastructure failures have `retryable: false` because the commit outcome may be unknown. Add idempotency before retrying mutations.
+
+`afterCommit` effects use outer execution services. Pass the data they need explicitly; they cannot rely on transaction connections or invocation-local state.
+
+## 5. Review persistent capabilities
+
+Request new handles after reconnecting. Capability creation no longer retains library caches or transaction connections.
+
+If permissions can change, check them again inside capability handlers. A previously captured principal does not provide automatic revocation.
+
+## 6. Update custom transports
+
+Support scoped map nodes, item expressions, and the reserved undefined/Option markers. Preserve the response envelope:
+
+```ts
+{ _tag: "Success", value }
+{ _tag: "Failure", error }
+```
+
+Propagate headers and interruption, and bind each duplex session to its actual connection. Use `PipelineServer.handle` to validate graphs rather than trusting client-supplied dependencies.
+
+## 7. Update the blog example
+
+Rebuild the library, then reinstall the blog's copied dependency after each library change. Foldkit's `evo` helper is now `modifyFields`. The example uses explicit peer overrides for Effect 4.0.6.
+
+For production, configure `BLOG_JWT_SECRET`, `BLOG_PUBLIC_ORIGIN`, and the initial `BLOG_ADMIN_PASSWORD`. See the [blog README](../../examples/blogapp/README.md) for setup.
+
+The updated example rotates refresh tokens atomically, filters draft events, and supports WebSocket upgrades through the Vite proxy.

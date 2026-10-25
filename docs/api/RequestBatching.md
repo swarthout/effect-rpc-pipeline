@@ -1,10 +1,20 @@
 # RequestBatching
 
-Create request-local partitioned caches backed by native Effect RequestResolvers. Construct each cache descriptor once in a service. Pipeline execution supplies RequestScope; native standalone RPCs can use Middleware and layer. makeScope supports custom adapters.
+Collect backend reads into batches and reuse results within one request. The resolver must perform a real bulk operation.
+
+## Common tasks
+
+1. Construct a `cache` descriptor once in a service or module.
+2. Use it from handlers to collect concurrent lookups.
+3. Partition it by principal or tenant when a graph uses several identities.
+
+Pipeline execution supplies `RequestScope`. For standalone native RPCs, apply `Middleware` and provide `layer`. Custom adapters can create a scope with `makeScope`.
 
 Import from `effect-rpc-pipeline/RequestBatching`. See the [API overview](../api.md) and [contracts and limits](../guides/contracts.md).
 
-These signatures are generated from the published declarations. Relative imports in the signatures refer to other package declarations. Update with `npm run docs:generate`.
+## Complete signatures
+
+These signatures come from the package declarations. Relative imports refer to other package modules.
 
 ```ts
 import * as Cache from "effect/Cache";

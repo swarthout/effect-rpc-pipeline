@@ -1,10 +1,24 @@
 # Pipeline
 
-Compose lazy remote calls with all, map, andThen, zipRight, and field. Data describes the plain data returned by finite pipelines. Expr, node, request and transport types describe the low-level wire protocol.
+Build a graph of remote calls and choose the data it returns. A remote value is lazy until run as an Effect.
+
+## Common tasks
+
+| Task | API |
+| --- | --- |
+| Select several results in one request | `all` |
+| Repeat calls for array items or an Option value | `map` |
+| Wait for earlier work before starting a new phase | `andThen`, `zipRight` |
+| Read a field whose name is reserved | `field` |
+| Describe a finite result without class methods | `Data<A>` |
+
+`Remote` describes a future result. The expression, node, request, and transport types support custom adapters.
 
 Import from `effect-rpc-pipeline/Pipeline`. See the [API overview](../api.md) and [contracts and limits](../guides/contracts.md).
 
-These signatures are generated from the published declarations. Relative imports in the signatures refer to other package declarations. Update with `npm run docs:generate`.
+## Complete signatures
+
+These signatures come from the package declarations. Relative imports refer to other package modules.
 
 ```ts
 import * as Effect from "effect/Effect";

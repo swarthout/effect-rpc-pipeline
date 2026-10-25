@@ -1,10 +1,22 @@
 # Sql
 
-Wrap selected pipeline graphs in an Effect SQL transaction. afterCommit registers sequential best-effort effects for a successful commit. TransactionFailed is never automatically retryable; use an application idempotency policy.
+Run a finite pipeline in an Effect SQL transaction and schedule work after a successful commit.
+
+## Common tasks
+
+- Add `transaction()` to server middleware to wrap a graph in one transaction.
+- Use `transaction({ when })` to choose which graphs need it.
+- Call `afterCommit` inside a transactional handler to register best-effort follow-up effects.
+
+After-commit effects run sequentially. For durable delivery, use an outbox.
+
+`TransactionFailed` has `retryable: false` because the commit outcome may be unknown. Add application idempotency before replaying a mutation.
 
 Import from `effect-rpc-pipeline/Sql`. See the [API overview](../api.md) and [contracts and limits](../guides/contracts.md).
 
-These signatures are generated from the published declarations. Relative imports in the signatures refer to other package declarations. Update with `npm run docs:generate`.
+## Complete signatures
+
+These signatures come from the package declarations. Relative imports refer to other package modules.
 
 ```ts
 import * as Effect from "effect/Effect";

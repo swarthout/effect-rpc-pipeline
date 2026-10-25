@@ -1,69 +1,206 @@
 # Contracts and limits
 
+Use this page to check what can cross a pipeline, how work is scheduled, and what happens when execution fails. For examples, start with the [README](../../README.md) or [usage guide](usage.md).
+
 ## Compatibility
 
-Version 0.1.0 is ESM only. Supported servers run Node.js 24.11+ in the 24.x line, or Node.js 26+. Browser clients require an ES2022-capable browser with `fetch`, WebSocket, and Web Crypto (`crypto.randomUUID`, generally requiring a secure context). CommonJS, Bun, and Deno are outside the tested release scope.
+Version 0.1.0 supports these environments:
 
-The tested Effect ecosystem baseline is 4.0.6. Use matching versions of Effect's platform and SQL packages. The peer range is deliberately limited to the 4.0 patch line (`~4.0.6`). Effect RPC, HTTP, sockets and SQL remain annotated unstable even though their import paths no longer include `unstable`. Review upstream changes and run the complete suite before extending the peer range.
+| Component | Requirement |
+| --- | --- |
+| Server | Node.js 24.11+ in the 24.x line, or Node.js 26+ |
+| Browser client | ES2022, `fetch`, WebSocket, and Web Crypto |
+| Module format | ESM |
+| Effect packages | Matching versions of Effect, platform, and SQL packages; tested at 4.0.6 |
+
+Browsers need `crypto.randomUUID`, which generally requires a secure context. CommonJS, Bun, and Deno are outside the tested release scope.
+
+The Effect peer range is `~4.0.6`. Effect's RPC, HTTP, socket, and SQL APIs still carry unstable annotations even though their import paths no longer contain `unstable`. Review upstream changes and run the full suite before widening that range.
 
 ## Construction and execution
 
-Building a `Remote` performs no network I/O. Running it as an Effect executes its graph. Re-running the same remote executes the graph again, including mutations. `Effect.all` runs separate remote Effects separately; use `Pipeline.all` to send one graph.
+### When a graph runs
 
-Map and sequencing callbacks run synchronously on the client with symbolic inputs. Ordinary JavaScript branching, string interpolation, arithmetic, or array indexing on a symbolic value cannot inspect a server result. Project fields, pass the remote into an RPC, select it, or compose another map. Use an RPC for data-dependent decisions.
+Building a `Remote` performs no network I/O. Running it as an Effect executes its graph. Running it again repeats that work, including mutations.
 
-Maps create lexical item scopes. Each call constructed inside a map callback runs for each item, even if its payload is independent of the item. A remote constructed outside the callback is shared. Nested maps can reference outer items; item references cannot escape their defining map. `andThen` waits for all operations in the prior phase, including when the prior selection is a literal. Independent work inside a phase runs concurrently.
+Use `Pipeline.all` to combine remote values into one graph. `Effect.all` runs the remote Effects separately and can send separate requests.
 
-Use `Pipeline.field(remote, "then")` for fields reserved by JavaScript or Effect, including `then`, `pipe`, `graph`, `toString`, and `~effect/*` protocol keys. Normal `name` and `length` data fields can be projected directly. Root RPC tags `then` and `__effect_rpc_pipeline_*` are reserved. Capability methods also cannot shadow `release`, `invoke`, `_tag`, `capabilityId`, `definitionId`, `group`, `owner`, or `context`. Dots in other RPC tags have no special meaning.
+### Symbolic callback inputs
+
+Map and sequencing callbacks run synchronously on the client. Their inputs describe future server results.
+
+You can project fields, pass them to RPCs, select them, or compose another map. JavaScript branching, interpolation, arithmetic, and array indexing cannot inspect those future results. Put decisions that need the data in an RPC handler.
+
+### Maps and phases
+
+A call constructed inside a map callback runs for each item, even if its payload does not use that item. A remote constructed outside the callback is shared.
+
+Nested maps can reference outer items. An item reference cannot escape the map that defines it.
+
+`andThen` waits for every operation in the preceding phase, even if that phase selects a literal. Independent work within a phase can run concurrently.
+
+### Reserved names
+
+Use `Pipeline.field(remote, name)` when a result field collides with a JavaScript or Effect property. For example, use `Pipeline.field(remote, "then")` rather than `remote.then`.
+
+| Location | Reserved names |
+| --- | --- |
+| Direct field projection | `then`, `pipe`, `graph`, `toString`, and `~effect/*` protocol keys |
+| Root RPC tags | `then` and names starting with `__effect_rpc_pipeline_` |
+| Capability methods | `release`, `invoke`, `_tag`, `capabilityId`, `definitionId`, `group`, `owner`, and `context` |
+
+Data fields named `name` and `length` project normally. Dots in other RPC tags have no special meaning.
 
 ## Values and schemas
 
-Finite pipelines carry JSON data, undefined, and Effect Options. Handler result and error classes cross this boundary as data fields, without prototypes, identity, custom methods, or `instanceof` behavior. `Pipeline.Data<A>` expresses finite success data. Use tagged-error matching (`Effect.catchTag`) rather than `instanceof` on remote domain errors. Native streams and direct capability calls use their declared Effect codecs and have their own schema behavior.
+### Finite results are data
 
-Payloads are validated using the RPC payload schema on the server. Both native Options and null-encoded Options can be supplied. References pass earlier decoded handler data to subsequent payload validation. Arbitrary client-side schema transformations are not performed on graph expressions: schemas whose decoded values require Date, Map, Set, binary buffers, custom class behavior, or other non-data values are unsuitable for finite pipelines. Convert those values to explicit data transfer schemas or use native RPC outside a finite graph.
+Finite pipelines carry JSON data, `undefined`, and Effect `Option` values. Result and error classes cross the boundary as fields, without their prototypes, identity, or custom methods.
 
-Unsupported input literals fail during graph construction. Unsupported final results, cycles, and oversized results fail with a protocol error instead of being silently coerced. Output structure is capped at 64 levels and 100,000 visited values. Undefined and Option values use reserved wire markers: `_id: "effect-rpc-pipeline/Undefined"` and `_id: "Option"`. Do not use those marker shapes as domain data. Objects merely tagged `Some` or `None` are preserved as ordinary domain objects.
+Use `Pipeline.Data<A>` to describe a finite success result. Match remote domain errors by tag, for example with `Effect.catchTag`, rather than `instanceof`.
 
-Success schemas define handler contracts, but finite aggregate results are data selections, not independently reconstructed schema instances. Client schema-service requirements remain conservative; graph payload transformations execute on the server. Validate custom transport responses before treating them as a trusted contract. Do not expose adapter APIs directly to untrusted application input.
+Native streams and direct capability calls use their declared Effect codecs. Their schema behavior is separate from finite graph selections.
+
+### Payload validation
+
+The server validates each payload with its RPC schema. Both native Options and null-encoded Options are accepted. A reference to an earlier result supplies that decoded handler data to the next payload's validation.
+
+Graph expressions do not run arbitrary client-side schema transformations. Finite graphs cannot carry decoded values that depend on `Date`, `Map`, `Set`, binary buffers, or custom class behavior. Represent those values with explicit data transfer schemas, or use native RPC outside a finite graph.
+
+Success schemas define handler contracts. The aggregate response is the selected data structure; the client does not reconstruct schema class instances from it. Client schema-service requirements remain conservative, while graph payload transformations run on the server.
+
+Custom transports must validate responses before treating them as trusted data. Adapter APIs should not be exposed directly to untrusted application input.
+
+### Rejected values and wire markers
+
+Unsupported input literals fail while the client builds the graph. Unsupported final results, cycles, and oversized results fail with a protocol error rather than being silently coerced.
+
+Output is limited to 64 levels and 100,000 visited values.
+
+These wire markers are reserved and must not be used as domain data:
+
+- `_id: "effect-rpc-pipeline/Undefined"`
+- `_id: "Option"`
+
+Objects that are merely tagged `Some` or `None` remain ordinary domain objects.
 
 ## Failure and atomicity
 
-Graph errors return `PipelineProtocolError`, including malformed structures, invalid references or paths, unsupported RPCs and values, and exceeded limits. `PipelineExecutionError` represents safe infrastructure failures. Declared handler errors retain their tags and data. Transport failures use native `RpcClientError`. Unexpected defects remain Effect defects and use native RPC defect handling over a network. Interruption propagates through the graph and active callbacks.
+### Error types
 
-Validation checks graph shape, scopes, references, cycles, paths and statically known root RPC tags before any handler starts. Payload validation and capability method validation can depend on earlier results and occur at invocation time. A runtime failure may happen after an earlier mutation has completed. Ordering is not isolation or rollback.
+| Failure | Result |
+| --- | --- |
+| Invalid graph, reference, path, method, value, or limit | `PipelineProtocolError` |
+| Server infrastructure failure | `PipelineExecutionError` |
+| Declared handler error | Its original tag and data |
+| Transport failure | Effect's `RpcClientError` |
+| Unexpected defect | An Effect defect, using native RPC defect handling over a network |
 
-`Sql.transaction()` wraps the selected finite graph in one Effect SQL transaction. Native RPC calls, streams, and direct calls on an already exported capability do not automatically pass through pipeline execution middleware. Put transaction and authorization policy inside domain handlers too when those entry points require it. Remote peer calls are rejected while pipeline transaction middleware is active, to avoid holding a transaction open on a peer response.
+Interruption propagates through the graph and active callbacks.
 
-An infrastructure transaction failure is marked `retryable: false`: a failed commit can have an unknown outcome. Do not automatically replay a mutation without application idempotency. `afterCommit` runs sequentially after a successful pipeline transaction, with outer execution services. Pass immutable data into deferred work; do not depend on an invocation-local principal, released connection, or request scope. Failures are reported through the configured callback and cannot undo a committed mutation. This mechanism is process-local and best-effort; durable delivery needs an outbox. Calling it outside an active transaction region is a defect.
+### Validation before execution
+
+Before starting a handler, the server checks the graph's structure, scopes, references, cycles, paths, and statically known root RPC tags.
+
+Payload validation and capability method validation may need earlier results, so those checks happen when the call is invoked. A runtime failure can therefore happen after an earlier mutation has completed. Ordering alone does not provide isolation or rollback.
+
+### Transaction boundaries
+
+`Sql.transaction()` wraps a selected finite graph in one Effect SQL transaction.
+
+Native RPC calls, streams, and direct calls on an exported capability do not automatically enter pipeline execution middleware. If those entry points also need transactions or authorization, enforce that policy in their domain handlers.
+
+Calls to remote peers are rejected while pipeline transaction middleware is active. This prevents a transaction from holding locks while it waits for a peer response.
+
+Transaction infrastructure errors have `retryable: false`: a failed commit may have an unknown outcome. Add application idempotency before automatically replaying a mutation.
+
+### Work after commit
+
+`afterCommit` effects run sequentially after a successful pipeline transaction. They use the outer execution services, after the transaction connection has been released.
+
+Pass immutable data into deferred work. It cannot depend on an invocation-local principal, a released connection, or the transaction's request scope.
+
+Failures are reported through the configured callback and cannot undo a committed mutation. Delivery is process-local and best-effort; use an outbox for durable delivery. Calling `afterCommit` outside an active transaction region is a defect.
 
 ## Lifetimes and authorization
 
-HTTP clients are reusable; each finite graph acquires and closes an internal scope. WebSocket clients, streams, callbacks and persistent capabilities belong to their connection's scope. Closing or replacing a duplex session clears its exported server handles and fails pending peer calls. Old handles do not survive reconnect; reacquire them. Release remote capabilities explicitly when no longer needed. Local callback exports are retained for the client session lifetime.
+### Client and handle lifetimes
 
-The duplex readiness handshake has a ten-second timeout and fails promptly if its stream closes before Ready. Callback work is interrupted when the session stream ends. Capability definition IDs are unique within a module registry; development tools must isolate/restart that registry when reloading definitions.
+| Resource | Lifetime |
+| --- | --- |
+| HTTP client | Reusable; each finite graph acquires and closes an internal scope |
+| WebSocket client and streams | The connection's owning scope |
+| Persistent capability handle | The duplex session and connection that exported it |
+| Local callback export | The client session |
 
-Capabilities capture application services and principals at creation. Library request caches, transaction connections, deferred regions and execution policies are not retained. A captured principal is an application authorization decision, not automatic token revocation. Recheck changing roles, suspension, ownership, and resource existence inside capability handlers when required. The blog example demonstrates these checks.
+Closing or replacing a duplex session clears its server handles and fails pending peer calls. After reconnecting, acquire new handles. Release a remote capability explicitly when it is no longer needed.
 
-Bearer helpers propagate credentials and delegate verification to the application. Native server middleware is authoritative for every protected invocation; client middleware is convenience wiring. Request caches must be partitioned by the actual principal or tenant when one graph can use several authorization contexts. A cache descriptor must be stable across lookups, and mutations must invalidate affected entries.
+The readiness handshake times out after ten seconds. It also fails if the stream closes before Ready. Closing the session stream interrupts callback work.
 
-Client middleware shared by several calls runs once around the batch, with a synthetic request whose payload is the graph. Header propagation is supported; per-RPC payload rewriting or short-circuiting with a domain result is not. Handler wrapper scheduling flags (`Rpc.fork` and `Rpc.uninterruptible`) do not configure graph scheduling; use Effect combinators inside a domain handler when that handler needs an interruption policy.
+Capability definition IDs are unique within a module registry. Development tooling must isolate or restart that registry when reloading definitions.
+
+### Captured services and changing permissions
+
+Capabilities capture application services and principals at creation. They do not retain library request caches, transaction connections, deferred regions, or execution policies.
+
+A captured principal does not provide automatic token revocation. Check current roles, suspension, ownership, and resource existence in capability handlers when those conditions can change. The blog example demonstrates these checks.
+
+### Authentication and caches
+
+Bearer helpers propagate credentials and delegate verification to the application. Server middleware authenticates each protected invocation; handlers enforce the caller's resource permissions.
+
+When one graph can use several principals or tenants, partition request caches by the actual identity. Create each cache descriptor once and invalidate affected entries after mutations.
+
+### Client middleware behavior
+
+Client middleware shared by several calls runs once around the batch. It receives a synthetic request whose payload is the graph. Header propagation is supported; per-RPC payload rewriting and short-circuiting with a domain result are not.
+
+Handler wrapper flags such as `Rpc.fork` and `Rpc.uninterruptible` do not configure graph scheduling. Use Effect combinators inside a domain handler when it needs its own interruption policy.
 
 ## Limits and deployment
+
+### Graph limits
+
+Set these options under `limits` on the server:
 
 | Server option | Default | Meaning |
 | --- | --- | --- |
 | `maxNodes` | 1,000 | Nodes in the submitted graph |
 | `maxMapItems` | 1,000 | Items in each mapped array |
 | `maxInvocations` | 10,000 | Total root/capability invocations in one graph |
-| `concurrency` | 64 | Active handler invocations across the entire graph, including all maps |
+| `concurrency` | 64 | Active handler invocations across the graph, including maps |
 | `maxDepth` | 64 | Submitted structure depth and map scope depth |
 | `maxExpressionNodes` | 100,000 | Visited request structure values, including literal data |
-| `maxExecutionSteps` | 100,000 | Total node executions, map items, expression evaluations, and projection path segments |
+| `maxExecutionSteps` | 100,000 | Node executions, map items, expression evaluations, and projection path segments |
 
-The high-level client also caps literal construction depth at 64; raising a server limit does not raise that fixed client guard. Finite positive options are floored to integers. Invalid or omitted options use the defaults. Each duplex session additionally caps registered server capabilities, pending reverse calls and queued callback events at 1,000 each. When a callback queue is saturated, cancellation delivery is best-effort; scope and connection cleanup still release local work.
+Finite positive options are floored to integers. Invalid or omitted options use the defaults.
 
-The execution-step limit is shared across the entire graph and all map scopes. It bounds pure template expansion independently of RPC invocation counts and is checked as work runs, before full results are materialized. It does not measure time spent inside application handlers or schema codecs.
+The high-level client has a fixed literal-depth cap of 64. Raising the server limit does not raise that client cap.
 
-Invocation limits count attempted handler invocations. Limits do not guarantee an all-or-nothing outcome; a map's size and dynamic invocation cost may be known only after earlier work runs. Concurrency also bounds RequestResolver batch windows. A graph with many eligible calls may require several bulk SQL queries even when it uses one transport request.
+### What the budgets count
 
-Configure HTTP request/body limits, timeouts, connection quotas, authentication rate limits, TLS, CORS and proxy/origin policy at the application or deployment boundary. No automatic retry, exactly-once delivery, cross-connection capabilities, durable event delivery, or unbounded-input support is promised. Telemetry labels use the configured server definition, known RPC tags, and invocation kind; payloads and bearer credentials are not added as attributes.
+The execution-step budget is shared across the graph and all maps. It bounds template expansion even when the templates make no RPC calls. Checks happen while work runs, before full results are materialized.
+
+This budget does not measure CPU time inside handlers or schema codecs. Invocation limits count attempted handler calls.
+
+Dynamic costs can become known only after earlier work runs. Exceeding a limit does not undo completed mutations.
+
+Concurrency also affects RequestResolver batch sizes. A graph can use several bulk database queries while still using one transport request.
+
+### Session limits
+
+Each duplex session caps these resources at 1,000 each:
+
+- Registered server capabilities.
+- Pending reverse calls.
+- Queued callback events.
+
+When the callback queue is full, cancellation delivery is best-effort. Scope and connection cleanup still release local work.
+
+### Deployment responsibilities
+
+Configure body limits, timeouts, connection quotas, authentication rate limits, TLS, CORS, and proxy/origin policy at the application or deployment boundary.
+
+The library does not provide automatic retries, exactly-once delivery, capabilities that survive a connection, durable event delivery, or unbounded inputs.
+
+Telemetry labels use the configured server definition, known RPC tags, and invocation kind. They do not include payloads or bearer credentials.
