@@ -1,5 +1,7 @@
 # Contributing
 
+The [documentation website](https://github.com/swarthout/effect-rpc-pipeline/tree/main/website) has its own development, build, and browser-check commands. Its content reuses the README, guides, and generated API reference.
+
 Use Node.js 24.11+ (24.x) or 26+, and npm. The root and the two examples have independent lockfiles. `repos/` contains read-only historical source references; do not import or edit those snapshots as part of library work.
 
 From a clean checkout:
