@@ -1,10 +1,24 @@
 # PipelineServer
 
-Serve HTTP and WebSocket RPC routes, or execute requests with handle. ServerOptions configures limits and lifecycle middleware. augment, layer, protocol schemas and PipelineRpc support transport adapters.
+Serve pipeline requests or execute them directly in the same process.
+
+## Common tasks
+
+| Task | API |
+| --- | --- |
+| Install an HTTP route | `layerHttp` |
+| Install a WebSocket route | `layerWebSocket` |
+| Validate and execute a request directly | `handle` |
+| Set work limits and middleware | `ServerOptions` |
+| Wrap request, execution, or invocation work | `makeMiddleware` |
+
+Adapter authors can use `augment`, `layer`, protocol schemas, and `PipelineRpc` for lower-level integration.
 
 Import from `effect-rpc-pipeline/PipelineServer`. See the [API overview](../api.md) and [contracts and limits](../guides/contracts.md).
 
-These signatures are generated from the published declarations. Relative imports in the signatures refer to other package declarations. Update with `npm run docs:generate`.
+## Complete signatures
+
+These signatures come from the package declarations. Relative imports refer to other package modules.
 
 ```ts
 import * as Effect from "effect/Effect";

@@ -1,24 +1,60 @@
-# Effect RPC Pipeline example
+# TodoMVC and RPC examples
 
-This example keeps ordinary Effect RPC handler layers and adds pipelining at the HTTP and WebSocket boundaries. It demonstrates exact Effect RPC tags, capability authentication, projected references in payloads, mapped friend lookups, explicitly ordered mutations, native Effect streams, a persistent WebSocket session, and native Effect tracing and metrics through `PipelineTelemetry.make()`.
+This example adds pipelining to ordinary Effect RPC handlers over HTTP and WebSocket. It includes a complete TodoMVC workflow with authentication, mutation-plus-refresh responses, and live updates.
 
-It also includes a complete TodoMVC-style application in `src/todo.ts`, `src/todo-server.ts`, and `src/todo-client.ts`. Calls are normal Effects; `Pipeline.all` combines queries and `Pipeline.andThen` builds each mutation's selected refresh response. `watchTodos` is a standard streaming RPC that emits an initial snapshot and subsequent updates. `src/todo-live.ts` installs HTTP and WebSocket routes on the same `/rpc` path, while `todo-websocket-server.ts` and `todo-websocket-client.ts` are runnable native Effect examples.
+## Run the example
 
-`src/todo-auth.ts` demonstrates the intended security integration:
+Build the library from the repository root:
 
-- `Authenticated` is a normal Effect `RpcMiddleware.Service`;
-- `Auth.layerBearer` extracts a redacted bearer credential;
-- an application-owned `AccessTokenVerifier` validates JWT algorithm, type, issuer, audience, lifetime, and claims with `jose`;
-- the middleware provides a typed `CurrentUser` to handlers;
-- write handlers require the `todos:write` scope;
-- every repository operation is scoped by `CurrentUser.id`; and
-- client middleware injects the `Authorization` header once around a complete pipeline.
+```sh
+npm run build
+```
 
-The symmetric signing key is deliberately local to this example. A production application should inject its verifier configuration and use a secret manager or a trusted HTTPS JWKS endpoint. The pipeline package does not issue tokens, store passwords, or implement OAuth/OIDC flows.
+Then install and test the example:
 
-From the repository root, run `npm run build`. Then in `examples/todoapp`:
+```sh
+cd examples/todoapp
+npm ci
+npm test
+```
 
-- `npm install`
-- `npm test` for the authenticated HTTP and WebSocket workflows, invalid-token checks, and cross-user isolation
-- `npm run start:websocket` to start the live server
-- `npm run client:websocket` in another terminal to run the streaming client
+Start the live server, then run the client in a second terminal in the same directory:
+
+```sh
+npm run start:websocket
+```
+
+```sh
+npm run client:websocket
+```
+
+The tests cover authenticated HTTP and WebSocket workflows, invalid tokens, and isolation between users.
+
+## Find the code
+
+| File | Role |
+| --- | --- |
+| `src/todo.ts` | Todo schemas and RPC contract |
+| `src/todo-server.ts` | Handlers |
+| `src/todo-client.ts` | Composed client queries and mutations |
+| `src/todo-live.ts` | HTTP and WebSocket routes sharing `/rpc` |
+| `src/todo-websocket-server.ts` | Runnable live server |
+| `src/todo-websocket-client.ts` | Runnable streaming client |
+| `src/todo-auth.ts` | Authentication and authorization wiring |
+
+`Pipeline.all` combines queries. `Pipeline.andThen` chooses the data returned after a mutation. `watchTodos` is a native streaming RPC that emits an initial snapshot and later updates.
+
+The smaller RPC examples also demonstrate projected payload references, mapped friend lookups, capability authentication, exact RPC tags, and tracing and metrics through `PipelineTelemetry.make()`.
+
+## Authentication and authorization
+
+The authentication flow uses native Effect RPC middleware:
+
+1. `Auth.layerBearer` extracts a redacted bearer credential.
+2. The application's `AccessTokenVerifier` checks the JWT with `jose`: algorithm, token type, issuer, audience, lifetime, and claims.
+3. The `Authenticated` middleware supplies `CurrentUser` to handlers.
+4. Repository operations use `CurrentUser.id` to isolate each user's data. Writes also require the `todos:write` scope.
+
+Client middleware adds the Authorization header once around each complete pipeline.
+
+The signing key is local to this example. A deployed application should supply its own verifier configuration, using a secret manager or trusted HTTPS JWKS endpoint. The pipeline package does not issue tokens, store passwords, or implement OAuth/OIDC flows.

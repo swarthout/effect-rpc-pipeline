@@ -1,10 +1,20 @@
 # Telemetry
 
-Construct lifecycle middleware with native Effect spans and bounded metric dimensions. Tracing and metrics are enabled by default; invocation spans can be disabled independently. No payload or credential is added to telemetry.
+Add Effect tracing and metrics around pipeline execution.
+
+## Common tasks
+
+- Call `make()` and add the result to server middleware.
+- Configure tracing and metrics separately, or set either to `false`.
+- Disable invocation spans independently when only graph-level tracing is needed.
+
+Tracing and metrics are enabled by default. Metric dimensions are bounded; payloads and credentials are excluded.
 
 Import from `effect-rpc-pipeline/Telemetry`. See the [API overview](../api.md) and [contracts and limits](../guides/contracts.md).
 
-These signatures are generated from the published declarations. Relative imports in the signatures refer to other package declarations. Update with `npm run docs:generate`.
+## Complete signatures
+
+These signatures come from the package declarations. Relative imports refer to other package modules.
 
 ```ts
 import { type Middleware } from "./PipelineServer.js";

@@ -1,29 +1,58 @@
 # Pipeline Press
 
-Pipeline Press is a full-stack blog application that exercises `effect-rpc-pipeline` in a realistic Effect and Foldkit codebase. Articles are public. Creating or editing posts, commenting, voting, and administration require a JWT-authenticated session.
+Pipeline Press is a blog built with Effect, Foldkit, and `effect-rpc-pipeline`. Anyone can read published articles. Writing, commenting, voting, and administration require a JWT-authenticated session.
 
 ## Run it
 
-Use Node.js 24.11+ (24.x) or 26+. From the repository root, run `npm ci` and `npm run build`. Then install from this directory and start the API and web app in separate terminals:
+Use Node.js 24.11+ in the 24.x line, or Node.js 26+. Build the library from the repository root:
+
+```sh
+npm ci
+npm run build
+```
+
+Then, from `examples/blogapp`, install the example and start its API:
 
 ```sh
 npm ci
 npm run dev:server
 ```
 
+In a second terminal in the same directory, start the web app:
+
 ```sh
 npm run dev
 ```
 
-Open `http://localhost:5174`. The development administrator is `admin` with password `admin-password-change-me`. The SQLite database is stored in `.data/blog.db` and is ignored by Git.
+Open `http://localhost:5174`.
+
+- Development user: `admin`
+- Development password: `admin-password-change-me`
+- SQLite database: `.data/blog.db`, ignored by Git
 
 The local package uses npm's `install-links=true` setting so the `file:../..` dependency is installed like a real package and shares the example's Effect runtime.
 
-After changing the library, rebuild it at the repository root and run `npm ci` here to refresh the copied package. The example overrides Foldkit 0.169.0's exact Effect 4.0.0 peer declarations to use the tested 4.0.6 platform/SQL ecosystem. These overrides are explicit and are exercised by the example tests. Restart the dev processes after changing capability definitions: definition identifiers must be registered only once within a module registry.
+### After library changes
+
+Rebuild at the repository root, then run `npm ci` in the example to refresh its copied dependency. Restart the dev processes after changing capability definitions; their IDs must be registered only once per module registry.
+
+The example explicitly overrides Foldkit 0.169.0’s Effect 4.0.0 peers to use the tested 4.0.6 platform and SQL packages. The example tests cover that dependency combination.
 
 The Vite proxy preserves the original Host for same-origin session checks and forwards WebSocket upgrades. Keep the frontend on the documented port; `strictPort` prevents silently selecting another origin.
 
-For deployment, set `NODE_ENV=production`, a random `BLOG_JWT_SECRET` of at least 32 bytes, and an HTTPS `BLOG_PUBLIC_ORIGIN` such as `https://blog.example.com`. The first database initialization also requires `BLOG_ADMIN_PASSWORD` with at least 16 characters; it creates `admin` only when that user is absent. Changing that variable does not change an existing user's password. Route `/session` and `/rpc` through the configured public origin and terminate TLS at your application host or trusted proxy. Production startup rejects missing configuration. Do not deploy the Vite development server as the production host.
+## Configure a deployment
+
+Set `NODE_ENV=production` and these variables:
+
+| Variable | Requirement |
+| --- | --- |
+| `BLOG_JWT_SECRET` | Random secret of at least 32 bytes |
+| `BLOG_PUBLIC_ORIGIN` | HTTPS origin, such as `https://blog.example.com` |
+| `BLOG_ADMIN_PASSWORD` | At least 16 characters; required when initializing a database without an admin user |
+
+The password variable creates `admin` only if that user is absent. Changing it does not reset an existing password. Production startup rejects missing configuration.
+
+Route `/session` and `/rpc` through the configured public origin. Terminate TLS at the application host or a trusted proxy. Use a production host rather than the Vite development server.
 
 ## What the application supports
 
@@ -69,7 +98,9 @@ src/
 
 `shared/rpcs.ts` is the transport contract. The server adopts it with standard `AppRpcs.of(...)` handlers and ordinary Effect services. The public, content, and admin handler factories are composed in `server/handlers/application.ts`.
 
-The Foldkit runtime depends on `BlogClient` as an Effect service. `layerHttpClient()` constructs the facade once and each finite pipeline execution owns its internal request scope. Commands simply yield the service:
+The Foldkit runtime uses `BlogClient` as an Effect service. `layerHttpClient()` constructs one reusable client; each finite pipeline execution owns its request scope.
+
+Commands request the service and call it:
 
 ```ts
 // Inside a Command.define execute callback:
@@ -141,9 +172,17 @@ The server also demonstrates:
 
 ## Browser sessions and SSR
 
-The normal RPC login, registration, and refresh methods remain useful for native clients. The browser uses `/session/login`, `/session/register`, `/session/refresh`, and `/session/logout` instead. Those same-origin routes keep the refresh token out of JavaScript and return only an access token, its expiration, and the current user. Protected pipeline calls read the current access token through `Auth.layerClientBearer`, while public calls send no credential.
+### Browser authentication
 
-`entry.server.ts` loads each route through `PipelineClient.layerClientInProcess`. This executes the same graph validation, handlers, request batching, middleware, telemetry, and SQL integration as the transport server without making an HTTP call back into the process. Feed and article data are passed to Foldkit as flags and embedded for hydration. Unknown article slugs render a real not-found page.
+Native clients can use the login, registration, and refresh RPCs. The browser instead calls `/session/login`, `/session/register`, `/session/refresh`, and `/session/logout`.
+
+These same-origin routes keep the refresh token out of JavaScript. They return an access token, its expiration, and the current user. Protected pipelines read the current access token through `Auth.layerClientBearer`; public calls send no credential.
+
+### Server rendering
+
+`entry.server.ts` loads page data through `PipelineClient.layerClientInProcess`. It runs the same validation, handlers, batching, middleware, telemetry, and SQL integration without an HTTP call back into the process.
+
+Feed and article data become Foldkit flags embedded for hydration. Unknown article slugs render a not-found page.
 
 ## Tests
 
@@ -153,18 +192,38 @@ npm test
 npm run build
 ```
 
-`src/blog.e2e.test.ts` starts a real Effect Node server on an ephemeral port and covers HTTP, WebSocket, SQLite, secure refresh cookies, JWT rotation and replay rejection, logout revocation, same-origin enforcement, authorization boundaries, authoring, moderation, pipelines, streams, capabilities, and callbacks. `src/ssr.e2e.test.ts` creates real SQLite data, loads it through the in-process client, and verifies the rendered Foldkit article and not-found pages. `src/web/application.scene.test.ts` tests Foldkit scenes and pure update stories.
+| Test | Coverage |
+| --- | --- |
+| `src/blog.e2e.test.ts` | Real Node server, HTTP/WebSocket, SQLite, cookies, JWT rotation, replay/logout checks, origins, permissions, authoring, moderation, pipelines, streams, capabilities, and callbacks |
+| `src/ssr.e2e.test.ts` | Real SQLite data loaded through the in-process client and rendered as article and not-found pages |
+| `src/web/application.scene.test.ts` | Foldkit scenes and pure update stories |
 
-`src/query-complexity.test.ts` guards against database N+1 regressions without adding test hooks to application code. A test tracer observes `db.query.text` on native Effect SQL spans and `rpc.method` on RPC spans, normalizes statements into fingerprints, and compares every client workflow at 2, 16, and 100 related rows. Reads and writes must remain exactly constant and stay within an explicit ceiling. The example sets global concurrency to the graph's 500-invocation budget so maps with multiple calls per item can enter the same resolver batch. A synthetic self-test proves that the assertion rejects a repeated per-row query while accepting one bulk `IN (...)` query.
+### Database query counts
 
-Coverage is discovered rather than maintained in a second RPC registry. The test compares observed server span tags with `AppRpcs.requests` and proxies the `BlogClient` facade to record invoked methods. Adding an RPC or client workflow makes the suite fail until a scaling scenario exercises it. The same coverage run starts a real WebSocket server for the stream and callback boundaries, which cannot be represented by the finite in-process pipeline client.
+`src/query-complexity.test.ts` checks for N+1 database regressions. A tracer reads `db.query.text` on Effect SQL spans and `rpc.method` on RPC spans, then groups equivalent statements.
+
+Each client workflow runs with 2, 16, and 100 related rows. Read and write counts must stay constant and below an explicit ceiling. A self-test proves that the check rejects repeated per-row queries and accepts one bulk `IN (...)` query.
+
+The example sets global concurrency to its 500-invocation budget. This lets maps with several calls per item enter the same resolver batch.
+
+The test compares observed RPC span tags with `AppRpcs.requests` and records calls to the `BlogClient` facade. Adding an RPC or client workflow requires a scaling scenario that exercises it.
+
+Streams and callbacks use a real WebSocket server in the same coverage run; they cannot be represented by a finite in-process graph.
 
 Known integration gaps and package findings are tracked in [PACKAGE_AUDIT.md](./PACKAGE_AUDIT.md).
 
 ## Example boundaries
 
-This application demonstrates integration patterns; it is not a complete deployment template. UI navigation changes the Model without implementing browser history. Direct `/posts/<slug>` URLs support SSR, and missing article responses use HTTP 404. Session restoration refreshes credentials on startup; automatic refresh before access-token expiry is not implemented. Reload or sign in again after expiration. The demo's refresh cookie is Secure and requires HTTPS in production; browsers treat localhost development specially.
+This example demonstrates integrations, rather than a complete deployment template. These UI and session behaviors are intentional:
+
+- UI navigation changes the Model without browser history. Direct `/posts/<slug>` URLs support SSR, and missing articles return HTTP 404.
+- Startup restores a session by refreshing credentials. There is no proactive refresh before access-token expiry; reload or sign in again after expiration.
+- The refresh cookie is Secure and needs HTTPS in production. Browsers treat localhost development specially.
 
 Foldkit DevTools is enabled only in development and can inspect form state and tokens. Use demonstration credentials while debugging. Whole-Model slow-phase logging is disabled to keep credential fields out of those diagnostics.
 
-Author capabilities recheck current suspension, roles and ownership. Public comment queries and post events exclude drafts. Post streams emit events only while the post currently exists and is published; deletion notifications and durable event replay are not provided. Application hosts still need deliberate rate limits, database backups, TLS, and proxy/origin configuration.
+Author capabilities recheck suspension, roles, and ownership. Public comment queries and post events exclude drafts.
+
+Post streams emit only while a post exists and is published. They do not provide deletion notifications or durable replay.
+
+Deployment still needs rate limits, database backups, TLS, and proxy/origin configuration.

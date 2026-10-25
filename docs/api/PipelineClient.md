@@ -1,10 +1,24 @@
 # PipelineClient
 
-Create HTTP, scoped WebSocket, in-process, or custom clients. layerClient helpers install a typed client service. Protocol helpers adapt native Effect transports; transportFromHandler adapts a transport-free handler.
+Create a typed client from an Effect RPC group. Choose the transport and lifetime that fit the caller.
+
+## Common tasks
+
+| Task | API |
+| --- | --- |
+| Execute finite graphs over HTTP | `makeHttp` |
+| Use a shared connection for calls, streams, and handles | `makeWebSocket` |
+| Run through the server in the same process | `makeInProcess` |
+| Provide a client as an Effect service | `layerClient*` helpers |
+| Supply a custom transport | `make`, protocol helpers, `transportFromHandler` |
+
+HTTP clients are reusable. WebSocket clients need an owning scope. In-process clients support finite graphs.
 
 Import from `effect-rpc-pipeline/PipelineClient`. See the [API overview](../api.md) and [contracts and limits](../guides/contracts.md).
 
-These signatures are generated from the published declarations. Relative imports in the signatures refer to other package declarations. Update with `npm run docs:generate`.
+## Complete signatures
+
+These signatures come from the package declarations. Relative imports refer to other package modules.
 
 ```ts
 import * as Context from "effect/Context";

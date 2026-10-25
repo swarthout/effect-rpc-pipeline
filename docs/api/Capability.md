@@ -1,10 +1,21 @@
 # Capability
 
-Define finite capability groups with make and create instances with fromHandlers. Release remote handles with release. Predicates inspect definitions, instances and wire refs. invokeLocal, invokeWire, toRef and fromRemoteRef are adapter-level APIs.
+Define a set of methods tied to one implementation, such as a session, document handle, or client callback.
+
+## Common tasks
+
+1. Call `make` with a definition ID and RPC group.
+2. Use the definition's `schema` in an RPC payload or result.
+3. Create an implementation with `fromHandlers`.
+4. Release a remote handle with `release` when it is no longer needed.
+
+Predicates inspect definitions, instances, and wire references. `invokeLocal`, `invokeWire`, `toRef`, and `fromRemoteRef` support custom adapters.
 
 Import from `effect-rpc-pipeline/Capability`. See the [API overview](../api.md) and [contracts and limits](../guides/contracts.md).
 
-These signatures are generated from the published declarations. Relative imports in the signatures refer to other package declarations. Update with `npm run docs:generate`.
+## Complete signatures
+
+These signatures come from the package declarations. Relative imports refer to other package modules.
 
 ```ts
 import * as Context from "effect/Context";
