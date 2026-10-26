@@ -1,6 +1,6 @@
 # Documentation website
 
-The website is a Foldkit application on Effect 4. The build renders every page to HTML; the browser hydrates those pages for navigation, search, and the graph demo. GitHub Pages serves the static files.
+The website is a Foldkit application on Effect 4. The build renders every page to HTML; the browser hydrates those pages for navigation, search, and query/mutation examples. GitHub Pages serves the static files.
 
 ## Run locally
 
@@ -64,8 +64,6 @@ To inspect production output separately, run `npm run preview --prefix website` 
 ## Build and runtime
 
 `@foldkit/markdown` parses and validates prose. Shiki highlights code during the build. The browser receives compiled documents and a local search index. Fonts are self-hosted; there are no analytics or third-party runtime requests.
-
-The graph demo is an illustrative simulation. Its state and effects follow Foldkit's Model, Message, and Command architecture.
 
 Generated content, static output, and browser artifacts are ignored by Git. The website is excluded from the npm package and has its own dependencies. Its overrides align Foldkit's exact Effect 4.0.0 peer declarations with the tested 4.0.6 baseline.
 

@@ -1,47 +1,19 @@
 import { describe, expect, test } from "vitest"
 import { Option } from "effect"
 import { fromString } from "foldkit/url"
-import { Demo, init, Message, update } from "./main"
+import { init, Message, update } from "./main"
 import { base, pages, searchPages } from "./content"
 import { routeForPath } from "./route"
 
 const initial = () => init(Option.getOrThrow(fromString(`https://example.com${base}`))).model
 
-describe("pipeline visualization", () => {
-  test("walks from lazy construction to dependent work and selection", () => {
-    const user = update(initial(), Message.ClickedDemoStep()).model
-    expect(user.demo._tag).toBe("User")
-    const parallel = update(user, Message.ClickedDemoStep()).model
-    expect(parallel.demo._tag).toBe("Parallel")
-    const complete = update(parallel, Message.ClickedDemoStep()).model
-    expect(complete.demo._tag).toBe("Complete")
-    expect(complete.demoPlayback).toBe("Paused")
-  })
-  test("reset invalidates an outstanding animation completion", () => {
-    const playing = update(initial(), Message.ClickedDemoRun()).model
-    const reset = update(playing, Message.ClickedDemoReset()).model
-    const stale = update(
-      reset,
-      Message.CompletedWaitForStep({ revision: playing.demoRevision }),
-    ).model
-    expect(stale.demo).toEqual(Demo.Idle())
-    expect(stale.demoPlayback).toBe("Paused")
-  })
-  test("navigation invalidates animation completions and closes the menu", () => {
-    const playing = update(initial(), Message.ClickedDemoRun()).model
-    const opened = update(playing, Message.ClickedMenu()).model
-    const navigated = update(
-      opened,
-      Message.ChangedUrl({ url: Option.getOrThrow(fromString(`https://example.com${base}api/`)) }),
-    ).model
-    const stale = update(
-      navigated,
-      Message.CompletedWaitForStep({ revision: playing.demoRevision }),
-    ).model
-    expect(stale.menu).toBe("Closed")
-    expect(stale.demo._tag).toBe("User")
-    expect(stale.demoPlayback).toBe("Paused")
-  })
+test("navigation closes the mobile menu", () => {
+  const opened = update(initial(), Message.ClickedMenu()).model
+  const navigated = update(
+    opened,
+    Message.ChangedUrl({ url: Option.getOrThrow(fromString(`https://example.com${base}api/`)) }),
+  ).model
+  expect(navigated.menu).toBe("Closed")
 })
 
 describe("documentation discovery", () => {

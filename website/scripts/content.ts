@@ -37,11 +37,10 @@ const definitions = [
   {
     slug: "getting-started",
     title: "Getting started",
+    description: "Install effect-rpc-pipeline and run your first typed RPC pipeline.",
     group: "Start here",
     source: "README.md",
-    text:
-      "# Getting started\n\nDefine an RPC contract, serve it on Node, and compose remote calls from a browser or Node client.\n\n" +
-      pick(readme, ["Install", "Quickstart"]),
+    text: "# Getting started\n\n" + pick(readme, ["Install", "Quickstart"]),
   },
   {
     slug: "concepts",
@@ -327,7 +326,9 @@ const pages = await Promise.all(
       ...symbols.map((title) => ({ level: 3, title, id: `symbol-${slugify(title)}` })),
     ]
     const description =
-      source.split("\n").find((line) => line && !line.startsWith("#")) ?? definition.title
+      definition.description ??
+      source.split("\n").find((line) => line && !line.startsWith("#")) ??
+      definition.title
     return {
       slug: definition.slug,
       title: definition.title,
