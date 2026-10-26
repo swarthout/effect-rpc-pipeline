@@ -47,15 +47,8 @@ const definitions = [
     slug: "concepts",
     title: "How pipelines work",
     group: "Start here",
-    source: "README.md",
-    text:
-      "# How pipelines work\n\n" +
-      pick(readme, [
-        "Why pipeline RPC?",
-        "How execution works",
-        "Compose calls and select results",
-        "Use clients as Effect services",
-      ]),
+    source: "docs/guides/how-pipelines-work.md",
+    text: await read("docs/guides/how-pipelines-work.md"),
   },
   {
     slug: "guides/composition",
@@ -170,8 +163,8 @@ if (!/^\/(?:[\w-]+\/)*$/.test(base)) {
 }
 const github = "https://github.com/swarthout/effect-rpc-pipeline/blob/main/"
 const highlighter = await createHighlighter({
-  themes: ["github-light", "github-dark"],
-  langs: ["typescript", "javascript", "json", "bash", "text"],
+  themes: ["github-light-high-contrast", "github-dark-high-contrast"],
+  langs: ["typescript", "javascript", "json", "bash", "graphql", "text"],
 })
 const highlights: Record<string, string> = {}
 const overview = await read("docs/snippets/overview.ts")
@@ -188,9 +181,35 @@ if (!heroCode) {
 }
 highlights[heroCode] = highlighter.codeToHtml(heroCode, {
   lang: "typescript",
-  themes: { light: "github-light", dark: "github-dark" },
+  themes: { light: "github-light-high-contrast", dark: "github-dark-high-contrast" },
   defaultColor: false,
 })
+
+const homepageSource = await read("docs/snippets/homepage.ts")
+const homepage: Record<string, string> = {}
+for (const match of homepageSource.matchAll(
+  /\/\/ homepage:(\w+):start\n([\s\S]*?)\n\s*\/\/ homepage:\1:end/g,
+)) {
+  const lines = match[2].split("\n")
+  const indent = Math.min(
+    ...lines.filter((line) => line.trim()).map((line) => line.match(/^\s*/)?.[0].length ?? 0),
+  )
+  const code = lines
+    .map((line) => line.slice(indent))
+    .join("\n")
+    .trim()
+  homepage[match[1]] = code
+  highlights[code] = highlighter.codeToHtml(code, {
+    lang: "typescript",
+    themes: { light: "github-light-high-contrast", dark: "github-dark-high-contrast" },
+    defaultColor: false,
+  })
+}
+for (const name of ["effect", "roundTrips", "query", "mutation"]) {
+  if (!homepage[name]) {
+    throw new Error(`Missing homepage snippet: ${name}`)
+  }
+}
 
 const headingsFor = (text: string) => {
   const counts = new Map<string, number>()
@@ -289,7 +308,7 @@ const pages = await Promise.all(
             : []
           highlights[block.value] = highlighter.codeToHtml(block.value, {
             lang: supported ? lang : "text",
-            themes: { light: "github-light", dark: "github-dark" },
+            themes: { light: "github-light-high-contrast", dark: "github-dark-high-contrast" },
             defaultColor: false,
             decorations,
           })
@@ -327,6 +346,6 @@ highlighter.dispose()
 await mkdir(new URL("../src/generated/", import.meta.url), { recursive: true })
 await writeFile(
   new URL("../src/generated/content.json", import.meta.url),
-  JSON.stringify({ base, pages, highlights, heroCode }),
+  JSON.stringify({ base, pages, highlights, heroCode, homepage }),
 )
 console.log(`Compiled ${pages.length} documentation pages from shared Markdown`)

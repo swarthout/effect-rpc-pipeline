@@ -11,6 +11,7 @@ import { AppRoute, urlToAppRoute } from "./route"
 export { view } from "./view"
 
 export const Theme = Schema.Literals(["System", "Light", "Dark"])
+export const SelectionMode = Schema.Literals(["Query", "Mutation"])
 export const Demo = defineTaggedUnion({
   Idle: {},
   User: {},
@@ -27,6 +28,7 @@ export const Model = Schema.Struct({
   demoPlayback: Schema.Literals(["Paused", "Playing"]),
   demoRevision: Schema.Number,
   notice: Schema.String,
+  selectionMode: SelectionMode,
 })
 export type Model = typeof Model.Type
 
@@ -48,6 +50,7 @@ export const Message = defineMessageUnion({
   ClickedDemoStep: {},
   ClickedDemoReset: {},
   CompletedWaitForStep: { revision: Schema.Number },
+  ClickedSelectionMode: { mode: SelectionMode },
 })
 export type Message = typeof Message.Type
 
@@ -137,6 +140,7 @@ export const init: Runtime.RoutingApplicationInit<Model, Message> = (url) => ({
     demoPlayback: "Paused",
     demoRevision: 0,
     notice: "",
+    selectionMode: "Query",
   },
   commands: [ReadTheme()],
 })
@@ -248,4 +252,7 @@ export const update = (model: Model, message: Message) =>
       revision === model.demoRevision && model.demoPlayback === "Playing"
         ? advanceDemo(model)
         : { model },
+    ClickedSelectionMode: ({ mode }) => ({
+      model: modifyFields(model, { selectionMode: () => mode }),
+    }),
   })

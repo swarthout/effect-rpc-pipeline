@@ -19,15 +19,18 @@ The dev server uses Foldkit's server entry to render routes. After editing share
 
 ## Edit the content
 
-| Content | Edit here |
-| --- | --- |
-| Overview and quickstart | Root `README.md` |
-| Detailed integrations and contracts | `docs/guides/` |
-| API introductions | `scripts/generate-api.mjs` at the repository root |
-| API signatures and comments | Library source, then regenerate the reference |
-| Website page selection | `website/scripts/content.ts` |
+| Content                             | Edit here                                                             |
+| ----------------------------------- | --------------------------------------------------------------------- |
+| Overview and quickstart             | Root `README.md`                                                      |
+| Detailed integrations and contracts | `docs/guides/`                                                        |
+| API introductions                   | `scripts/generate-api.mjs` at the repository root                     |
+| API signatures and comments         | Library source, then regenerate the reference                         |
+| Homepage code examples              | `docs/snippets/homepage.ts`, checked by the root `docs:check` command |
+| Website page selection              | `website/scripts/content.ts`                                          |
 
 The README remains a standalone introduction. The content script selects its sections and the guides into focused website pages.
+
+The narrative “How pipelines work” page lives in `docs/guides/how-pipelines-work.md`. Its examples are synchronized from the checked files in `docs/snippets/` by the root `docs:generate` command.
 
 After API changes, run these commands from the repository root:
 
@@ -49,10 +52,10 @@ npx playwright install chromium
 npm run test:browser
 ```
 
-| Check | Verifies |
-| --- | --- |
-| `check` | Content compilation, types, state/search tests, static build, links, anchors, assets, metadata, and sitemap |
-| `test:browser` | Hydration, clicked navigation, focus, clipboard, search, themes, mobile layout, and reading without JavaScript |
+| Check          | Verifies                                                                                                                                                                    |
+| -------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `check`        | Content compilation, types, state/search tests, static build, links, anchors, assets, metadata, and sitemap                                                                 |
+| `test:browser` | Hydration, navigation, focus, clipboard, search, query/mutation examples, text sizes, contrast in both themes, mobile layout, enlarged text, and reading without JavaScript |
 
 Browser tests start and stop their own preview server. Port 4173 must be free.
 
@@ -80,9 +83,9 @@ Each route has its own `index.html`, so deep links work without SPA rewrites. `4
 
 Set these variables for the entire build:
 
-| Variable | Default | Purpose |
-| --- | --- | --- |
-| `SITE_BASE` | `/effect-rpc-pipeline/` | URL path prefix; must start and end with `/` |
+| Variable      | Default                       | Purpose                                       |
+| ------------- | ----------------------------- | --------------------------------------------- |
+| `SITE_BASE`   | `/effect-rpc-pipeline/`       | URL path prefix; must start and end with `/`  |
 | `SITE_ORIGIN` | `https://swarthout.github.io` | Origin used in canonical URLs and the sitemap |
 
 For a custom domain or root-hosted preview, use `SITE_BASE=/`. Set `SITE_ORIGIN` to the new origin, configure the domain in GitHub Pages, and add its `CNAME` file to `website/public/`.

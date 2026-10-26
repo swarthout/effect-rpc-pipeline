@@ -136,4 +136,30 @@ for (const [name, code] of snippets) {
   readme = readme.slice(0, first) + block + readme.slice(last + end.length)
 }
 if (!check) await writeFile("README.md", readme)
-console.log(check ? "API reference and README snippets are current" : "Updated API reference and README snippets")
+
+const narrativeSnippets = new Map()
+for (const [path, prefix] of [["docs/snippets/concepts.ts", "narrative"], ["docs/snippets/homepage.ts", "homepage"]]) {
+  const source = await readFile(path, "utf8")
+  const pattern = new RegExp(`// ${prefix}:(\\w+):start\\n([\\s\\S]*?)\\n\\s*// ${prefix}:\\1:end`, "g")
+  for (const match of source.matchAll(pattern)) {
+    const lines = match[2].split("\n")
+    const indent = Math.min(...lines.filter(line => line.trim()).map(line => line.match(/^\s*/)[0].length))
+    narrativeSnippets.set(match[1], lines.map(line => line.slice(indent)).join("\n").trim())
+  }
+}
+const narrativePath = "docs/guides/how-pipelines-work.md"
+let narrative = await readFile(narrativePath, "utf8")
+for (const [name, sourceName] of [["sequential", "sequential"], ["selection", "query"], ["map", "map"], ["mutation", "mutation"], ["adoption", "adoption"], ["services", "services"]]) {
+  const code = narrativeSnippets.get(sourceName)
+  if (!code) throw new Error(`Missing narrative source snippet: ${sourceName}`)
+  const start = `<!-- narrative:${name}:start -->`
+  const end = `<!-- narrative:${name}:end -->`
+  const first = narrative.indexOf(start)
+  const last = narrative.indexOf(end)
+  if (first < 0 || last < first) throw new Error(`Missing narrative snippet markers: ${name}`)
+  const block = `${start}\n\`\`\`ts\n${code}\n\`\`\`\n${end}`
+  if (check && narrative.slice(first, last + end.length) !== block) throw new Error(`Stale narrative snippet: ${name}; run npm run docs:generate`)
+  narrative = narrative.slice(0, first) + block + narrative.slice(last + end.length)
+}
+if (!check) await writeFile(narrativePath, narrative)
+console.log(check ? "API reference, README, and narrative snippets are current" : "Updated API reference, README, and narrative snippets")

@@ -8,7 +8,7 @@ You define the RPCs with Effect. This library adds a way to compose them on the 
 
 Start with [installation](#install) and the [quickstart](#quickstart), or read [how execution works](#how-execution-works). The rest of this README introduces authentication, streams, capabilities, batching, and transactions.
 
-The [usage guide](docs/guides/usage.md) has detailed integrations. The [API reference](docs/api.md) lists every public type and function.
+Read [How pipelines work](docs/guides/how-pipelines-work.md) for the API design tradeoffs and the approach behind this library. The [usage guide](docs/guides/usage.md) has detailed integrations, and the [API reference](docs/api.md) lists every public type and function.
 
 ## Why pipeline RPC?
 
