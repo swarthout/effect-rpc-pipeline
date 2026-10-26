@@ -3,7 +3,6 @@ import { Command, Runtime, type Update } from "foldkit"
 import * as Dom from "foldkit/dom"
 import * as Render from "foldkit/render"
 import { defineMessageUnion } from "foldkit/message"
-import { defineTaggedUnion } from "foldkit/schema"
 import { load, pushUrl, UrlRequest } from "foldkit/navigation"
 import { modifyFields } from "foldkit/struct"
 import { Url, toString as urlToString } from "foldkit/url"
@@ -12,21 +11,12 @@ export { view } from "./view"
 
 export const Theme = Schema.Literals(["System", "Light", "Dark"])
 export const SelectionMode = Schema.Literals(["Query", "Mutation"])
-export const Demo = defineTaggedUnion({
-  Idle: {},
-  User: {},
-  Parallel: {},
-  Complete: {},
-})
 export const Model = Schema.Struct({
   route: AppRoute,
   theme: Theme,
   menu: Schema.Literals(["Closed", "Open"]),
   query: Schema.String,
   maybeCopied: Schema.Option(Schema.String),
-  demo: Demo,
-  demoPlayback: Schema.Literals(["Paused", "Playing"]),
-  demoRevision: Schema.Number,
   notice: Schema.String,
   selectionMode: SelectionMode,
 })
@@ -46,10 +36,6 @@ export const Message = defineMessageUnion({
   ClickedCopy: { text: Schema.String },
   CompletedCopy: { text: Schema.String },
   FailedCopy: {},
-  ClickedDemoRun: {},
-  ClickedDemoStep: {},
-  ClickedDemoReset: {},
-  CompletedWaitForStep: { revision: Schema.Number },
   ClickedSelectionMode: { mode: SelectionMode },
 })
 export type Message = typeof Message.Type
@@ -122,12 +108,6 @@ const Copy = Command.define("Copy", {
       Effect.catch(() => Effect.succeed(Message.FailedCopy())),
     ),
 })
-const WaitForStep = Command.define("WaitForStep", {
-  args: { revision: Schema.Number },
-  messages: [Message.CompletedWaitForStep],
-  execute: ({ revision }) =>
-    Effect.sleep("900 millis").pipe(Effect.as(Message.CompletedWaitForStep({ revision }))),
-})
 
 export const init: Runtime.RoutingApplicationInit<Model, Message> = (url) => ({
   model: {
@@ -136,36 +116,11 @@ export const init: Runtime.RoutingApplicationInit<Model, Message> = (url) => ({
     menu: "Closed",
     query: "",
     maybeCopied: Option.none(),
-    demo: Demo.Idle(),
-    demoPlayback: "Paused",
-    demoRevision: 0,
     notice: "",
     selectionMode: "Query",
   },
   commands: [ReadTheme()],
 })
-
-const nextDemo = (demo: typeof Demo.Type) =>
-  Demo.match(demo, {
-    Idle: () => Demo.User(),
-    User: () => Demo.Parallel(),
-    Parallel: () => Demo.Complete(),
-    Complete: () => Demo.Idle(),
-  })
-const advanceDemo = (model: Model): Update.Return<Model, Message> => {
-  const demo = nextDemo(model.demo)
-  const isFinished = demo._tag === "Complete"
-  return {
-    model: modifyFields(model, {
-      demo: () => demo,
-      demoPlayback: () => (isFinished ? "Paused" : model.demoPlayback),
-    }),
-    commands:
-      !isFinished && model.demoPlayback === "Playing"
-        ? [WaitForStep({ revision: model.demoRevision })]
-        : [],
-  }
-}
 
 export const update = (model: Model, message: Message) =>
   Message.match<Update.Return<Model, Message>>(message, {
@@ -191,8 +146,6 @@ export const update = (model: Model, message: Message) =>
           menu: () => "Closed",
           query: () => "",
           maybeCopied: () => Option.none(),
-          demoRevision: (revision) => revision + 1,
-          demoPlayback: () => "Paused",
         }),
         commands:
           isPageChanged || Option.isSome(url.hash)
@@ -229,29 +182,6 @@ export const update = (model: Model, message: Message) =>
         notice: () => "Clipboard unavailable. Select and copy the code manually.",
       }),
     }),
-    ClickedDemoRun: () => {
-      const demoRevision = model.demoRevision + 1
-      return {
-        model: modifyFields(model, {
-          demo: () => Demo.User(),
-          demoPlayback: () => "Playing",
-          demoRevision: () => demoRevision,
-        }),
-        commands: [WaitForStep({ revision: demoRevision })],
-      }
-    },
-    ClickedDemoStep: () => advanceDemo(model),
-    ClickedDemoReset: () => ({
-      model: modifyFields(model, {
-        demo: () => Demo.Idle(),
-        demoPlayback: () => "Paused",
-        demoRevision: (revision) => revision + 1,
-      }),
-    }),
-    CompletedWaitForStep: ({ revision }) =>
-      revision === model.demoRevision && model.demoPlayback === "Playing"
-        ? advanceDemo(model)
-        : { model },
     ClickedSelectionMode: ({ mode }) => ({
       model: modifyFields(model, { selectionMode: () => mode }),
     }),

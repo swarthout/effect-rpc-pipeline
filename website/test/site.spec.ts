@@ -33,20 +33,21 @@ test("clicked anchors scroll and focus; page navigation starts at the top", asyn
   await expect(page.locator("#main-content")).toBeFocused()
 })
 
-test("home hydrates, steps the graph, resets, and runs to completion", async ({ page }) => {
+test("home identifies the package and hydrates its query selection", async ({ page }) => {
   const errors: Array<string> = []
   page.on("pageerror", (error) => errors.push(error.message))
   await page.goto(base)
-  await expect(page.getByRole("heading", { name: "Compose the calls." })).toBeVisible()
-  const demo = page.getByRole("region", { name: "Interactive pipeline execution demo" })
-  await demo.getByRole("button", { name: "Next step" }).click()
-  await expect(demo.getByRole("heading", { name: "Run the pipeline", exact: true })).toBeVisible()
-  await demo.getByRole("button", { name: "Next step" }).click()
-  await expect(demo.getByRole("heading", { name: "Resolve dependencies" })).toBeVisible()
-  await demo.getByRole("button", { name: "Reset" }).click()
-  await expect(demo.getByRole("heading", { name: "Build the graph" })).toBeVisible()
-  await demo.getByRole("button", { name: "Run pipeline" }).click()
-  await expect(demo.getByRole("heading", { name: "Return the selection" })).toBeVisible()
+  await expect(
+    page.getByRole("heading", {
+      level: 1,
+      name: "effect-rpc-pipeline",
+      exact: true,
+    }),
+  ).toBeVisible()
+  await expect(page.locator(".hero-subtitle")).toHaveText("Effect-native RPC promise pipelining.")
+  await expect(page.locator(".header .brand")).toHaveText("effect-rpc-pipeline")
+  await page.getByRole("button", { name: "After a mutation" }).click()
+  await expect(page.getByLabel("Example selected response")).toContainText("Augusta")
   expect(errors).toEqual([])
 })
 

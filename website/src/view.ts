@@ -23,7 +23,7 @@ const brand = (h: Builder) =>
     [h.Href(href()), h.Class("brand"), h.AriaLabel("effect-rpc-pipeline home")],
     [
       h.img([h.Class("brand-mark"), h.Src(`${import.meta.env.BASE_URL}favicon.svg`), h.Alt("")]),
-      h.span([], ["effect", h.span([h.Class("brand-slash")], ["/"]), "rpc-pipeline"]),
+      h.span([], ["effect-rpc-pipeline"]),
     ],
   )
 
@@ -88,150 +88,6 @@ const codeBlock = (code: string, model: Model, h: Builder, label = "TypeScript")
   )
 }
 
-const demoDescriptions = {
-  Idle: {
-    number: "00",
-    title: "Build the graph",
-    text: "Remote calls are lazy values. Connect them without sending a request.",
-  },
-  User: {
-    number: "01",
-    title: "Run the pipeline",
-    text: "Send one graph to the server. findUser runs first because the other calls need its result.",
-  },
-  Parallel: {
-    number: "02",
-    title: "Resolve dependencies",
-    text: "The user ID is available. getProfile and listFriendIds can now run concurrently.",
-  },
-  Complete: {
-    number: "03",
-    title: "Return the selection",
-    text: "The server returns the selected user, profile, and friend IDs together.",
-  },
-}
-
-export const demoView = (model: Model, h: Builder): Html => {
-  const phase = model.demo._tag
-  const description = demoDescriptions[phase]
-  const userStatus = phase === "Idle" ? "Ready" : phase === "User" ? "Running" : "Complete"
-  const childStatus =
-    phase === "Parallel" ? "Running" : phase === "Complete" ? "Complete" : "Waiting"
-  const node = (name: string, status: string, detail: string) =>
-    h.div(
-      [h.Class(`graph-node node-${status.toLowerCase()}`)],
-      [
-        h.div([h.Class("node-heading")], [h.span([h.Class("status-dot")], []), h.code([], [name])]),
-        h.span([h.Class("node-detail")], [detail]),
-        h.span([h.Class("node-status")], [status]),
-      ],
-    )
-  return h.section(
-    [
-      h.Id("pipeline-demo"),
-      h.Class("demo-section"),
-      h.AriaLabel("Interactive pipeline execution demo"),
-    ],
-    [
-      h.div(
-        [h.Class("section-heading")],
-        [
-          h.p([h.Class("eyebrow")], ["FOLLOW THE DATA"]),
-          h.h3([], ["Follow the execution"]),
-          h.p([], ["Step through a pipeline to see how the server schedules its work."]),
-        ],
-      ),
-      h.div(
-        [h.Class("demo-panel")],
-        [
-          h.div(
-            [h.Class("demo-explanation")],
-            [
-              h.span([h.Class("step-number")], [description.number]),
-              h.div(
-                [h.AriaLive("polite"), h.Role("status")],
-                [h.h3([], [description.title]), h.p([], [description.text])],
-              ),
-              h.div(
-                [h.Class("demo-controls")],
-                [
-                  h.button(
-                    [
-                      h.Class("button button-primary"),
-                      h.OnClick(Message.ClickedDemoRun()),
-                      h.Disabled(model.demoPlayback === "Playing"),
-                    ],
-                    ["Run pipeline", " ↗"],
-                  ),
-                  h.button(
-                    [
-                      h.Class("button button-outline"),
-                      h.OnClick(Message.ClickedDemoStep()),
-                      h.Disabled(model.demoPlayback === "Playing" || phase === "Complete"),
-                    ],
-                    ["Next step"],
-                  ),
-                  h.button(
-                    [h.Class("text-button"), h.OnClick(Message.ClickedDemoReset())],
-                    ["Reset"],
-                  ),
-                ],
-              ),
-              h.p([h.Class("demo-caption")], ["Illustrative simulation · no network requests"]),
-            ],
-          ),
-          h.div(
-            [h.Class("graph")],
-            [
-              h.div(
-                [h.Class("graph-topline")],
-                [
-                  h.span([], ["SERVER EXECUTION"]),
-                  h.span([], [phase === "Idle" ? "Graph ready" : "1 pipeline request"]),
-                ],
-              ),
-              h.div(
-                [h.Class("graph-root")],
-                [
-                  node(
-                    "findUser",
-                    userStatus,
-                    phase === "Parallel" || phase === "Complete"
-                      ? 'id: "user_1"'
-                      : '{ email: "ada@example.com" }',
-                  ),
-                ],
-              ),
-              h.div([h.Class("graph-connector"), h.AriaHidden(true)], [h.span([], ["user.id"])]),
-              h.div(
-                [h.Class("graph-children")],
-                [
-                  node("getProfile", childStatus, "{ userId: user.id }"),
-                  node("listFriendIds", childStatus, "{ userId: user.id }"),
-                ],
-              ),
-              h.div(
-                [h.Class(`graph-result ${phase === "Complete" ? "result-complete" : ""}`)],
-                [
-                  h.span([], ["SELECTED RESULT"]),
-                  h.code(
-                    [],
-                    [
-                      phase === "Complete"
-                        ? '{ user: { name: "Ada" }, profile: { bio: "…" }, friendIds: ["user_2"] }'
-                        : "{ user, profile, friendIds }",
-                    ],
-                  ),
-                ],
-              ),
-            ],
-          ),
-        ],
-      ),
-    ],
-  )
-}
-
 const footer = (h: Builder) =>
   h.footer(
     [h.Class("footer")],
@@ -263,7 +119,8 @@ const landing = (model: Model, h: Builder) =>
                 [h.Class("hero-meta")],
                 [h.span([h.Class("version-pill")], ["v0.1"]), h.span([], ["BUILT ON EFFECT 4"])],
               ),
-              h.h1([], ["Compose the calls.", h.br([]), h.span([], ["Skip the round trips."])]),
+              h.h1([], ["effect-rpc-pipeline"]),
+              h.p([h.Class("hero-subtitle")], ["Effect-native RPC promise pipelining."]),
               h.p(
                 [h.Class("hero-description")],
                 [
@@ -296,7 +153,6 @@ const landing = (model: Model, h: Builder) =>
                   ),
                 ],
               ),
-              h.p([h.Class("hero-footnote")], ["TypeScript · Node.js · Modern browsers · MIT"]),
             ],
           ),
           h.div(
@@ -311,14 +167,6 @@ const landing = (model: Model, h: Builder) =>
                 ],
               ),
               codeBlock(heroCode, model, h),
-              h.div(
-                [h.Class("example-bottom")],
-                [
-                  h.span([h.Class("status-dot")], []),
-                  h.span([], ["Compose now. Execute together."]),
-                  h.code([], ["yield* →"]),
-                ],
-              ),
             ],
           ),
         ],
@@ -340,7 +188,7 @@ const landing = (model: Model, h: Builder) =>
         ],
       ),
       effectIntegrationView(h, (code, label) => codeBlock(code, model, h, label)),
-      roundTripsView(h, (code, label) => codeBlock(code, model, h, label), demoView(model, h)),
+      roundTripsView(h, (code, label) => codeBlock(code, model, h, label)),
       selectedResultsView(model, h, (code, label) => codeBlock(code, model, h, label)),
       h.section(
         [h.Class("explore-section")],

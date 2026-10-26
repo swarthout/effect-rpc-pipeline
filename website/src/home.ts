@@ -52,35 +52,6 @@ export const effectIntegrationView = (h: Builder, renderCode: RenderCode) =>
                   "A remote call is an Effect. Yield it in Effect.gen, handle a declared failure with catchTag, and provide application services through Layers.",
                 ],
               ),
-              h.figure(
-                [
-                  h.Class("contract-diagram"),
-                  h.AriaLabel("A shared RPC schema connects typed clients to server handlers"),
-                ],
-                [
-                  h.div(
-                    [h.Class("contract-root")],
-                    [h.strong([], ["Shared RPC group"]), h.code([], ["payload · success · error"])],
-                  ),
-                  h.div(
-                    [h.Class("contract-branches")],
-                    [
-                      h.div(
-                        [],
-                        [h.strong([], ["Client"]), h.span([], ["Typed calls and composition"])],
-                      ),
-                      h.div(
-                        [],
-                        [h.strong([], ["Server"]), h.span([], ["Handlers and middleware"])],
-                      ),
-                    ],
-                  ),
-                  h.figcaption(
-                    [],
-                    ["Your existing schemas and server middleware still define the contract."],
-                  ),
-                ],
-              ),
               h.a(
                 [h.Href(href("guides/authentication")), h.Class("inline-link")],
                 ["See authentication with Effect services →"],
@@ -122,7 +93,7 @@ const tripRow = (h: Builder, operation: string) =>
     ],
   )
 
-export const roundTripsView = (h: Builder, renderCode: RenderCode, demo: Html) =>
+export const roundTripsView = (h: Builder, renderCode: RenderCode) =>
   h.section(
     [
       h.Id("fewer-round-trips"),
@@ -208,7 +179,6 @@ export const roundTripsView = (h: Builder, renderCode: RenderCode, demo: Html) =
           h.figcaption([], ["Two dependent lookups, compared by client/server round trips."]),
         ],
       ),
-      demo,
     ],
   )
 
